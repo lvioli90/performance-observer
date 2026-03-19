@@ -22,9 +22,8 @@ argo:
   workflow_template_filter: ""   # empty = observe all; narrow below via label
 
   # Label selector to narrow which workflows to watch.
-  # The load injection workflow in 'datalake' uses a known label; adjust to
-  # distinguish test-run workflows from other traffic if needed.
-  workflow_label_selector: ""
+  # Filters to the 'pdgs' partitionkey only — avoids picking up unrelated traffic.
+  workflow_label_selector: "partitionkey=pdgs"
 
   # Argo Server REST API base URL.
   # If empty, falls back to Kubernetes CRD API via kubeconfig.
@@ -56,7 +55,8 @@ stac:
   public_endpoint: "https://discover-uat.iride.earth"
 
   token: ""
-  collection_id: ""    # left empty: resolved per-product from MinIO artifact
+  collection_id: ""    # left empty: resolved per-product from MinIO artifact (kafka-message.json)
+  # partitionkey=pdgs → stacPublicEndpoint from partitionkey-config-awf-etl-ingestor ConfigMap
   verify_tls: true
 
 # --------------------------------------------------------
