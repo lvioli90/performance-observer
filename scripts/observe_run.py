@@ -49,6 +49,7 @@ from core.persistence import PersistenceManager
 from collectors.argo import ArgoCollector
 from collectors.k8s import K8sCollector
 from collectors.stac import StacCollector
+from collectors.minio_artifact import MinioArtifactCollector
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -214,6 +215,27 @@ def _timeseries_loop(
         ctx.stop_event.wait(timeout=ctx.poll_timeseries_flush_sec)
 
 
+def _artifact_loop(
+    ctx: RunContext,
+    minio_collector,
+    correlator,
+    pm: PersistenceManager,
+) -> None:
+    """
+    Polls MinIO for kafka-message.json artifacts from completed omnipass workflows.
+    This is the primary STAC item discovery path (most reliable source).
+    """
+    logger = logging.getLogger("observer.artifact_loop")
+    while not ctx.stop_event.is_set():
+        try:
+            minio_collector.poll(correlator)
+            pm.flush_dirty_products(ctx)
+        except Exception as exc:
+            logger.warning("Artifact poll error (will retry): %s", exc)
+
+        ctx.stop_event.wait(timeout=ctx.poll_artifact_sec)
+
+
 def _checkpoint_loop(ctx: RunContext, pm: PersistenceManager) -> None:
     """Periodically saves a checkpoint of the full in-memory state."""
     logger = logging.getLogger("observer.checkpoint_loop")
@@ -264,19 +286,31 @@ def main() -> None:
     _setup_logging(ctx.output_dir, verbose=args.verbose)
     logger = logging.getLogger("observer.main")
     logger.info("=" * 60)
-    logger.info("Performance Observer starting")
-    logger.info("run_id       = %s", ctx.run_id)
-    logger.info("output_dir   = %s", ctx.output_dir)
-    logger.info("argo_ns      = %s", ctx.argo_namespace)
-    logger.info("max_duration = %ds", ctx.max_duration_sec)
-    logger.info("grace_period = %ds", ctx.grace_period_sec)
+    logger.info("Performance Observer starting — IRIDE ingestion pipeline")
+    logger.info("run_id            = %s", ctx.run_id)
+    logger.info("output_dir        = %s", ctx.output_dir)
+    logger.info("argo_ns           = %s", ctx.argo_namespace)
+    logger.info("dispatcher tpl    = %s", ctx.corr_dispatcher_template)
+    logger.info("omnipass tpl      = %s", ctx.corr_omnipass_template)
+    logger.info("max_duration      = %ds", ctx.max_duration_sec)
+    logger.info("grace_period      = %ds", ctx.grace_period_sec)
+    logger.info("poll_pod_sec      = %ds  (aggressive: podGC 30s on omnipass)", ctx.poll_pod_sec)
+    logger.info("poll_metrics_sec  = %ds  (aggressive: podGC 30s on omnipass)", ctx.poll_metrics_sec)
+    logger.info("minio_endpoint    = %s", ctx.minio_endpoint or "(not configured)")
+    logger.info("artifact_stac     = %s", ctx.corr_use_artifact_stac)
     logger.info("=" * 60)
+    if not ctx.minio_endpoint:
+        logger.warning(
+            "MinIO not configured — STAC discovery will use API polling fallback only. "
+            "Set minio.* in config for artifact-based (reliable) STAC item discovery."
+        )
 
     # Initialize components
     pm = PersistenceManager(ctx.output_dir)
     argo = ArgoCollector(ctx)
     k8s = K8sCollector(ctx)
     stac_col = StacCollector(ctx)
+    minio_col = MinioArtifactCollector(ctx)
     correlator = Correlator(ctx)
 
     # Optional resume from checkpoint
@@ -306,14 +340,23 @@ def main() -> None:
         threading.Thread(
             target=_pod_loop, args=(ctx, k8s, pm),
             name="pod-loop", daemon=True
+            # NOTE: poll_pod_sec=15 is intentionally aggressive due to
+            # podGC: OnPodSuccess with deleteDelayDuration=30s on ingestor-omnipass.
         ),
         threading.Thread(
             target=_metrics_loop, args=(ctx, k8s, pm),
             name="metrics-loop", daemon=True
+            # NOTE: poll_metrics_sec=20 for same reason — pods are deleted 30s after success.
         ),
         threading.Thread(
             target=_stac_loop, args=(ctx, stac_col, pm),
             name="stac-loop", daemon=True
+            # Fallback STAC polling for when MinIO artifact is unavailable.
+        ),
+        threading.Thread(
+            target=_artifact_loop, args=(ctx, minio_col, correlator, pm),
+            name="artifact-loop", daemon=True
+            # Primary STAC discovery: reads kafka-message.json from MinIO after omnipass completes.
         ),
         threading.Thread(
             target=_timeseries_loop, args=(ctx, argo, pm),

@@ -101,9 +101,12 @@ class RunContext:
         # --- Polling intervals (seconds) ---
         p = cfg.get("polling", {})
         self.poll_workflow_sec: int = int(p.get("workflow_status_sec", 15))
-        self.poll_pod_sec: int = int(p.get("pod_status_sec", 20))
-        self.poll_metrics_sec: int = int(p.get("pod_metrics_sec", 30))
-        self.poll_stac_sec: int = int(p.get("stac_sec", 45))
+        # NOTE: omnipass has podGC: OnPodSuccess + deleteDelayDuration=30s.
+        # Pod polling must be aggressive (≤15s) to catch succeeded pods before GC.
+        self.poll_pod_sec: int = int(p.get("pod_status_sec", 15))
+        self.poll_metrics_sec: int = int(p.get("pod_metrics_sec", 20))
+        self.poll_stac_sec: int = int(p.get("stac_sec", 30))
+        self.poll_artifact_sec: int = int(p.get("artifact_check_sec", 20))
         self.poll_timeseries_flush_sec: int = int(p.get("timeseries_flush_sec", 30))
 
         # --- Timing ---
@@ -129,37 +132,46 @@ class RunContext:
         # --- STAC config ---
         s = cfg.get("stac", {})
         self.stac_endpoint: str = s.get("endpoint", "")
+        self.stac_public_endpoint: str = s.get("public_endpoint", "")
         self.stac_token: str = s.get("token", "")
         self.stac_collection: str = s.get("collection_id", "")
         self.stac_verify_tls: bool = bool(s.get("verify_tls", True))
 
+        # --- MinIO config (for kafka-message.json artifact reading) ---
+        m = cfg.get("minio", {})
+        self.minio_endpoint: str = m.get("endpoint", "")
+        self.minio_access_key: str = m.get("access_key", "")
+        self.minio_secret_key: str = m.get("secret_key", "")
+        self.minio_artifact_bucket: str = m.get("artifact_bucket", "argo-artifacts")
+        self.minio_secure: bool = bool(m.get("secure", False))
+
         # --- Correlation config ---
         c = cfg.get("correlation", {})
-        self.corr_object_key_label: str = c.get("object_key_label", "")
-        self.corr_product_id_regex: str = c.get(
-            "product_id_from_object_key",
-            r"(?P<product_id>[^/]+)(?:\.zip|\.tar\.gz|\.tgz|)$",
+        # Dispatcher workflow identification
+        self.corr_dispatcher_template: str = c.get("dispatcher_template", "ingestion-dispatcher")
+        self.corr_dispatcher_s3_key_param: str = c.get("dispatcher_s3_key_param", "s3-key")
+        self.corr_dispatcher_s3_bucket_param: str = c.get("dispatcher_s3_bucket_param", "s3-bucket")
+        # Omnipass workflow identification
+        self.corr_omnipass_template: str = c.get("omnipass_template", "ingestor-omnipass")
+        self.corr_omnipass_reference_param: str = c.get("omnipass_reference_param", "reference")
+        # Product ID extraction from s3 key
+        self.corr_product_id_s3_key_regex: str = c.get(
+            "product_id_from_s3_key",
+            r"(?P<product_id>[^/]+?)(?:\.zip|\.tar\.gz|\.tgz|\.nc|\.h5)?$",
         )
+        # STAC item ID derivation (fallback when artifact is not available)
         self.corr_stac_id_template: str = c.get(
             "stac_item_id_from_product_id", "{product_id}"
         )
-        self.corr_wf_name_contains_product: bool = bool(
-            c.get("workflow_name_contains_product", False)
-        )
-        self.corr_wf_name_regex: str = c.get(
-            "product_id_from_workflow_name_regex",
-            r"ingestion-(?P<product_id>.+)-[a-z0-9]{5}$",
-        )
+        # Whether to read kafka-message.json artifacts from MinIO for STAC discovery
+        self.corr_use_artifact_stac: bool = bool(c.get("use_artifact_stac_discovery", True))
+        # Time-window fallback
         self.corr_time_window_sec: int = int(c.get("time_window_fallback_sec", 60))
 
-        # Pre-compile correlation regexes (may raise if invalid)
-        self._product_id_re: Optional[re.Pattern] = None
-        if self.corr_product_id_regex:
-            self._product_id_re = re.compile(self.corr_product_id_regex)
-
-        self._wf_name_re: Optional[re.Pattern] = None
-        if self.corr_wf_name_regex:
-            self._wf_name_re = re.compile(self.corr_wf_name_regex)
+        # --- Semaphore monitoring ---
+        sem = cfg.get("semaphore", {})
+        self.semaphore_configmap_name: str = sem.get("configmap_name", "semaphore-ingestors-uat")
+        self.semaphore_configmap_key: str = sem.get("configmap_key", "workflow")
 
         # --- Step tracking ---
         self.tracked_steps: List[str] = cfg.get("tracked_steps", [])
@@ -248,32 +260,8 @@ class RunContext:
     # Correlation helpers (stateless, no lock needed)
     # ------------------------------------------------------------------
 
-    def extract_product_id_from_object_key(self, object_key: str) -> Optional[str]:
-        """Apply the configured regex to extract product_id from a MinIO object key."""
-        if not self._product_id_re or not object_key:
-            return None
-        m = self._product_id_re.search(object_key)
-        if m:
-            try:
-                return m.group("product_id")
-            except IndexError:
-                return None
-        return None
-
-    def extract_product_id_from_workflow_name(self, wf_name: str) -> Optional[str]:
-        """Apply the configured regex to extract product_id from a workflow name."""
-        if not self._wf_name_re or not wf_name:
-            return None
-        m = self._wf_name_re.search(wf_name)
-        if m:
-            try:
-                return m.group("product_id")
-            except IndexError:
-                return None
-        return None
-
     def derive_stac_item_id(self, product_id: str) -> str:
-        """Derive the expected STAC item id from a product_id using the configured template."""
+        """Derive the expected STAC item id from a product_id (fallback template)."""
         if not self.corr_stac_id_template:
             return product_id
         return self.corr_stac_id_template.format(product_id=product_id)

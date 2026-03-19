@@ -9,5 +9,8 @@ matplotlib>=3.7.0
 # Kubernetes API client (required for K8s and Argo-via-kubeconfig collectors)
 kubernetes>=28.1.0
 
+# MinIO client (required for kafka-message.json artifact reading from omnipass exit-handler)
+minio>=7.2.0
+
 # Optional: faster YAML parser
 # pyyaml[libyaml]>=6.0
