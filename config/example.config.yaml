@@ -6,7 +6,10 @@
 #   1. ingestion-dispatcher  (params: s3-bucket, s3-key, partitionkey)
 #   2. ingestor-omnipass     (params: reference=s3://bucket/key, partitionkey)
 #
-# Correlation key: s3://datalake-uat-drop-bucket/{s3-key} is shared by both.
+# Products land at the ROOT of datalake-uat-drop-bucket (no directory prefix):
+#   s3://datalake-uat-drop-bucket/IMH01_0_ST__OPT8_20251219T....zip
+#
+# Correlation key: s3-key = "IMH01_0_ST__OPT8_....zip" (filename only)
 # ============================================================
 
 run_id: "baseline-run-001"
@@ -77,7 +80,7 @@ minio:
   # Must match the dispatcher's s3-bucket parameter (default "drop-bucket").
   # If empty, T0 falls back to dispatcher workflow_created_at.
   drop_bucket: "datalake-uat-drop-bucket"
-  drop_prefix: ""           # Optional key prefix to filter (e.g. "incoming/"). Empty = all.
+  drop_prefix: ""           # Products land at the root of the drop bucket (no collection prefix).
   drop_poll_sec: 15         # How often to list new objects in the drop-bucket.
   drop_lookback_sec: 120    # On startup, scan this many seconds back to catch in-flight objects.
   drop_orphan_sec: 180      # Flag as orphan if no dispatcher workflow seen within N seconds.
@@ -143,7 +146,8 @@ correlation:
   # --- Product ID extraction ---
   # Regex applied to the s3-key (or path extracted from reference) to get product_id.
   # Named group "product_id" is required.
-  # Matches the filename without extension: "path/to/S2A_MSIL2A_20230101.zip" → "S2A_MSIL2A_20230101"
+  # Products land at root of drop-bucket → s3-key = "IMH01_0_ST__OPT8_....zip" (no directory prefix).
+  # Extracts filename without extension: "IMH01_0_ST__OPT8_20251219T....zip" → "IMH01_0_ST__OPT8_20251219T...."
   product_id_from_s3_key: "(?P<product_id>[^/]+?)(?:\\.zip|\\.tar\\.gz|\\.tgz|\\.nc|\\.h5)?$"
 
   # --- STAC item ID derivation ---
