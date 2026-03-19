@@ -124,7 +124,12 @@ class Correlator:
             product_id = self._correlate_omnipass(wf)
 
         if product_id is None:
-            logger.debug("No correlation for %s wf=%s", wf_type, wf.workflow_name)
+            logger.warning(
+                "Cannot correlate %s wf=%s (params=%s) — "
+                "check that pod annotations contain inputs.parameters "
+                "or that the drop-bucket watcher is running",
+                wf_type, wf.workflow_name, list(wf.parameters.keys()) or "empty",
+            )
             return None
 
         wf.product_id = product_id
@@ -233,18 +238,29 @@ class Correlator:
         s3_bucket = wf.parameters.get(s3_bucket_param, "drop-bucket")
 
         if not s3_key:
-            logger.debug(
-                "Dispatcher %s has no '%s' parameter", wf.workflow_name, s3_key_param
-            )
-            return None
+            # Fallback: match against MinIO drop-watcher events by time-window.
+            # Needed when pod annotations don't carry workflow-level parameters.
+            s3_key, s3_bucket_from_event = self._s3_key_from_drop_events(wf)
+            if s3_key:
+                s3_bucket = s3_bucket_from_event or s3_bucket
+                logger.info(
+                    "Dispatcher %s: '%s' not in pod params — resolved from drop-watcher: %s",
+                    wf.workflow_name, s3_key_param, s3_key,
+                )
+            else:
+                logger.debug(
+                    "Dispatcher %s has no '%s' parameter and no drop-watcher match",
+                    wf.workflow_name, s3_key_param,
+                )
+                return None
 
         s3_url = f"s3://{s3_bucket}/{s3_key}"
         wf.object_key = s3_url
 
         product_id = self._extract_product_id_from_s3_key(s3_key)
         if product_id:
-            logger.debug(
-                "Dispatcher correlation: wf=%s s3_key=%s product_id=%s",
+            logger.info(
+                "Dispatcher correlated: wf=%s s3_key=%s product_id=%s",
                 wf.workflow_name, s3_key, product_id,
             )
         return product_id
@@ -266,10 +282,21 @@ class Correlator:
         reference = wf.parameters.get(reference_param, "")
 
         if not reference:
-            logger.debug(
-                "Omnipass %s has no '%s' parameter", wf.workflow_name, reference_param
-            )
-            return None
+            # Fallback: match against a dispatcher ProductRecord by time-window.
+            # Needed when pod annotations don't carry workflow-level parameters.
+            product_id = self._product_id_from_dispatcher_timing(wf)
+            if product_id:
+                logger.info(
+                    "Omnipass %s: '%s' not in pod params — matched product_id=%s "
+                    "from dispatcher timing",
+                    wf.workflow_name, reference_param, product_id,
+                )
+            else:
+                logger.debug(
+                    "Omnipass %s has no '%s' parameter and no dispatcher match",
+                    wf.workflow_name, reference_param,
+                )
+            return product_id
 
         wf.object_key = reference
 
@@ -278,11 +305,64 @@ class Correlator:
 
         product_id = self._extract_product_id_from_s3_key(s3_key)
         if product_id:
-            logger.debug(
-                "Omnipass correlation: wf=%s reference=%s product_id=%s",
+            logger.info(
+                "Omnipass correlated: wf=%s reference=%s product_id=%s",
                 wf.workflow_name, reference, product_id,
             )
         return product_id
+
+    # ------------------------------------------------------------------
+    # Parameter fallback helpers
+    # ------------------------------------------------------------------
+
+    def _s3_key_from_drop_events(
+        self, wf: WorkflowRecord
+    ) -> tuple:
+        """
+        Find the closest MinIO drop-watcher event within corr_time_window_sec
+        of wf.created_at.  Returns (s3_key, s3_bucket) or ("", "").
+        """
+        if wf.created_at is None:
+            return ("", "")
+        window = self.ctx.corr_time_window_sec
+        with self.ctx._lock:
+            events = dict(self.ctx.drop_bucket_events)
+        best_key = ""
+        best_delta: Optional[float] = None
+        for s3_key, t0 in events.items():
+            delta = abs((wf.created_at - t0).total_seconds())
+            if delta <= window and (best_delta is None or delta < best_delta):
+                best_delta = delta
+                best_key = s3_key
+        bucket = self.ctx.minio_drop_bucket if best_key else ""
+        return (best_key, bucket)
+
+    def _product_id_from_dispatcher_timing(
+        self, wf: WorkflowRecord
+    ) -> Optional[str]:
+        """
+        Find a dispatcher-correlated ProductRecord whose dispatcher finished
+        within corr_time_window_sec before this omnipass started.
+        Used when omnipass pod annotations don't carry the 'reference' parameter.
+        """
+        if wf.created_at is None:
+            return None
+        window = self.ctx.corr_time_window_sec
+        with self.ctx._lock:
+            products = list(self.ctx.products.values())
+        best_id: Optional[str] = None
+        best_delta: Optional[float] = None
+        for prod in products:
+            # Only match products that have a dispatcher but no omnipass yet
+            if not prod.dispatcher_finished_at:
+                continue
+            if prod.workflow_name:
+                continue  # already has an omnipass
+            delta = (wf.created_at - prod.dispatcher_finished_at).total_seconds()
+            if 0 <= delta <= window and (best_delta is None or delta < best_delta):
+                best_delta = delta
+                best_id = prod.product_id
+        return best_id
 
     # ------------------------------------------------------------------
     # Regex helpers
@@ -328,8 +408,8 @@ class Correlator:
                 )
                 self.ctx.products[product_id] = record
                 self.ctx._products_dirty.append(product_id)
-                logger.debug(
-                    "Created ProductRecord: product_id=%s from %s wf=%s",
+                logger.info(
+                    "New product tracked: product_id=%s from %s wf=%s",
                     product_id, wf_type, wf.workflow_name,
                 )
             else:
