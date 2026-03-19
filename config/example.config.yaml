@@ -32,7 +32,7 @@ argo:
   server_url: "https://workflows-uat.iride.earth:443"
   # Bearer token from Argo UI → User Info → "Using Your Login With The CLI" → ARGO_TOKEN.
   # Format: "Bearer v2:..." (copy the full value including the "Bearer " prefix).
-  token: ""   # PLUG-IN: paste ARGO_TOKEN here
+  token: "Bearer v2:eyJhbGciOiJSU0EtT0FFUC0yNTYiLCJlbmMiOiJBMjU2R0NNIiwiemlwIjoiREVGIn0.nzTgiVk5plK7QIo1E_d9xa3gf-7WjRT9bHcfHg9g8IQXpnaK_i8cF9KBO63PaIkCwwsnplYnmgPwCOWxPKLKu9em1YqBqZozDtZk5WxZx3FgEO8eUQvb1JCEO2JLo5JMQwT3eAgD_-cEOkcjDW5CjEEVvt8RnbfhB4Yqmw-dQYeeTJWjnAsBkX0_evP7tQUV8tYYZA9xi5t_J1UleWT3MyxUr2I0lxv4EHVToggPZOwsvDHOXOPv0j2aJ5h7jfO7pgNxKa1IgzcLdtt7XXMW6X3435IYr5GYrxXpvDfi1-pyHMcIdQ3bmqIXqd68Gy268CE4-zaxCTnLzGKhc81E4Q.sLSR0iM-JZ2xgGdf.vqb2atOH8Zdgo432V7UTyizsPeWqSY45HifIxuu67TBdzM8wvrzbFZjF1qNnC-p7cH78g3p2nkF0kR2BePQFtkcox24cxYhypFsvTT0kQti3cxz4CLrD4I9x2feat8sxoC_ict1aTCDxzPznnB6OkutW6PDXH9AfKrGSYyuL__OBP_Fl71OOxMcN93L0rRTCc-eWwLai1KkzP1wO7KPq.Ci1mL3pAJLEl7kMGimpZlg"
   verify_tls: true
   # The Argo Server requires HTTP/1.1 (ARGO_HTTP1=true in CLI config).
   # The HTTP client in collectors/argo.py uses requests which defaults to HTTP/1.1 — no change needed.
