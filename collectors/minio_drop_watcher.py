@@ -70,6 +70,8 @@ class MinioDropWatcher:
         self._watermark: Optional[datetime] = None
         # Keys flagged as orphaned (no dispatcher workflow seen within timeout)
         self._orphaned: Set[str] = set()
+        # Clock-skew error: log full actionable message once, then suppress
+        self._clock_skew_error_count: int = 0
 
     # ------------------------------------------------------------------
     # MinIO client (shared factory — same pattern as minio_artifact.py)
@@ -184,7 +186,26 @@ class MinioDropWatcher:
                 self._watermark = latest_seen - timedelta(seconds=2)
 
         except Exception as exc:
-            logger.warning("MinioDropWatcher: list_objects failed: %s", exc)
+            if _is_clock_skew_error(exc):
+                self._clock_skew_error_count += 1
+                if self._clock_skew_error_count == 1:
+                    logger.error(
+                        "MinioDropWatcher: clock skew detected — local clock differs too much "
+                        "from %s.  All drop-bucket polls will fail until this is fixed.\n"
+                        "  Fix (Linux):  sudo ntpdate -u pool.ntp.org\n"
+                        "            or: sudo timedatectl set-ntp true && sudo systemctl restart systemd-timesyncd\n"
+                        "  Fix (macOS):  sudo sntp -sS pool.ntp.org",
+                        self.ctx.minio_endpoint,
+                    )
+                elif self._clock_skew_error_count % 10 == 0:
+                    logger.warning(
+                        "MinioDropWatcher: clock skew still present (%d consecutive failures) — "
+                        "drop-bucket watching disabled until clock is synced",
+                        self._clock_skew_error_count,
+                    )
+            else:
+                self._clock_skew_error_count = 0
+                logger.warning("MinioDropWatcher: list_objects failed: %s", exc)
 
         return new_objects
 
@@ -238,3 +259,13 @@ class MinioDropWatcher:
     def get_t0(self, s3_key: str) -> Optional[datetime]:
         """Return T0 for a given s3_key, or None if not yet seen."""
         return self._seen.get(s3_key)
+
+
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
+
+def _is_clock_skew_error(exc: Exception) -> bool:
+    """Return True if the exception is an S3 RequestTimeTooSkewed error."""
+    msg = str(exc)
+    return "RequestTimeTooSkewed" in msg or "request time" in msg.lower() and "skew" in msg.lower()

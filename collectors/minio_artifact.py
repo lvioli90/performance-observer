@@ -85,6 +85,8 @@ class MinioArtifactCollector:
         # product_id → already fetched T0 (dedup for stat_object reads)
         self._t0_fetched: Set[str] = set()
         self._client = None
+        # Clock-skew error: log actionable message once, then suppress
+        self._clock_skew_warned: bool = False
 
     # ------------------------------------------------------------------
     # MinIO client (lazy init, shared for both T0 and artifact reads)
@@ -162,11 +164,23 @@ class MinioArtifactCollector:
             )
             return t0
         except Exception as exc:
-            # Object may have been deleted or key is wrong
-            logger.warning(
-                "stat_object failed for s3://%s/%s (product=%s): %s",
-                s3_bucket, s3_key, product_id, exc,
-            )
+            if _is_clock_skew_error(exc):
+                if not self._clock_skew_warned:
+                    self._clock_skew_warned = True
+                    logger.error(
+                        "MinioArtifactCollector: clock skew detected — T0 resolution "
+                        "from drop-bucket will fail until local clock is synced with %s.\n"
+                        "  Fix (Linux):  sudo ntpdate -u pool.ntp.org\n"
+                        "            or: sudo timedatectl set-ntp true && sudo systemctl restart systemd-timesyncd\n"
+                        "  Fix (macOS):  sudo sntp -sS pool.ntp.org",
+                        self.ctx.minio_endpoint,
+                    )
+            else:
+                # Object may have been deleted or key is wrong
+                logger.warning(
+                    "stat_object failed for s3://%s/%s (product=%s): %s",
+                    s3_bucket, s3_key, product_id, exc,
+                )
             return None
 
     # ------------------------------------------------------------------
@@ -281,6 +295,12 @@ def _is_not_found(exc: Exception) -> bool:
     """Return True if the MinIO exception means the object doesn't exist yet."""
     msg = str(exc).lower()
     return any(k in msg for k in ("nosuchkey", "no such key", "does not exist", "404"))
+
+
+def _is_clock_skew_error(exc: Exception) -> bool:
+    """Return True if the exception is an S3 RequestTimeTooSkewed error."""
+    msg = str(exc)
+    return "RequestTimeTooSkewed" in msg or ("request time" in msg.lower() and "skew" in msg.lower())
 
 
 def _item_id_from_url(stac_url: str) -> Optional[str]:
