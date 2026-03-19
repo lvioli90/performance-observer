@@ -29,11 +29,13 @@ argo:
   workflow_label_selector: "partitionkey=pdgs"
 
   # Argo Server REST API base URL.
-  # If empty, falls back to Kubernetes CRD API via kubeconfig.
-  # Example: "https://argo-server.datalake.svc:2746"
-  server_url: ""
-  token: ""
+  server_url: "https://workflows-uat.iride.earth:443"
+  # Bearer token from Argo UI → User Info → "Using Your Login With The CLI" → ARGO_TOKEN.
+  # Format: "Bearer v2:..." (copy the full value including the "Bearer " prefix).
+  token: ""   # PLUG-IN: paste ARGO_TOKEN here
   verify_tls: true
+  # The Argo Server requires HTTP/1.1 (ARGO_HTTP1=true in CLI config).
+  # The HTTP client in collectors/argo.py uses requests which defaults to HTTP/1.1 — no change needed.
 
 # --------------------------------------------------------
 # Kubernetes API
