@@ -60,19 +60,42 @@ kubernetes:
 # STAC catalog
 # --------------------------------------------------------
 stac:
-  # Internal STAC API endpoint (used by the ingestor itself).
-  # Resolved per-partitionkey from partitionkey-config-awf-etl-ingestor ConfigMap.
-  # Override here if you want the observer to query a specific endpoint directly.
-  endpoint: "http://stac-api.datalake.svc/api"   # PLUG-IN: real internal endpoint
+  # STAC polling endpoint.
+  #
+  # When running INSIDE the cluster (pod/job):
+  #   Use the internal service URL — no token required.
+  #   endpoint: "http://stac-api.datalake.svc/api"
+  #
+  # When running OUTSIDE the cluster (laptop / CI):
+  #   Use the public endpoint and set a valid Bearer token below.
+  #   The collector automatically switches to public_endpoint when a token is set.
+  endpoint: "http://stac-api.datalake.svc/api"   # internal (no auth)
 
-  # Public STAC endpoint (used to build stac_url in kafka-message.json).
-  # Matches 'stacPublicEndpoint' in partitionkey-config for the pdgs partitionkey.
+  # Public STAC endpoint (https://discover-uat.iride.earth).
+  # Used as the polling endpoint when stac.token is set (external access).
+  # Also used to build stac_url in kafka-message.json.
   public_endpoint: "https://discover-uat.iride.earth"
 
+  # Bearer token for the public STAC endpoint.
+  # Obtain via: curl -s -d "client_id=geo-commerce&grant_type=password&username=...
+  #              &password=..." https://auth-uat.iride.earth/realms/marketplace/
+  #              protocol/openid-connect/token | jq -r .access_token
+  # Leave empty when using the internal endpoint from inside the cluster.
   token: ""
-  collection_id: ""    # left empty: resolved per-product from MinIO artifact (kafka-message.json)
-  # partitionkey=pdgs → stacPublicEndpoint from partitionkey-config-awf-etl-ingestor ConfigMap
+
+  # STAC collection id.
+  # Left empty: resolved per-product from MinIO artifact (kafka-message.json).
+  # Set explicitly only when artifact-based discovery is disabled or unavailable.
+  # For partitionkey=pdgs check the collection field in kafka-message.json.
+  collection_id: ""
   verify_tls: true
+
+  # Re-ingestion note:
+  # Products tracked by the observer are already present in the STAC catalog.
+  # Publication of a new ingest cycle is confirmed by comparing the item's
+  # properties.updated field against workflow_finished_at (omnipass completion).
+  # stac_seen_at is set to properties.updated (catalog's own timestamp),
+  # NOT to datetime.now() — this gives accurate stac_publish_sec KPIs.
 
 # --------------------------------------------------------
 # MinIO / S3 artifact access
