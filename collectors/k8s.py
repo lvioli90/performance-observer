@@ -184,6 +184,13 @@ class K8sCollector:
                         record = self._parse_pod(raw_pod)
                         if record is None:
                             continue
+                        # Apply workflow type filter: keep only dispatcher and omnipass pods
+                        if record.workflow_name:
+                            wn = record.workflow_name.lower()
+                            dispatcher_kw = self.ctx.corr_dispatcher_template.lower()
+                            omnipass_kw = self.ctx.corr_omnipass_template.lower()
+                            if dispatcher_kw not in wn and omnipass_kw not in wn:
+                                continue
                         # Apply tracked_steps filter
                         if self.ctx.tracked_steps and record.step_name:
                             if not any(
