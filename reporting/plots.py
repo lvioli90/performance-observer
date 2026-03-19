@@ -5,14 +5,19 @@ Generates all diagnostic plots using matplotlib only (no seaborn).
 
 Plots generated
 ---------------
-1.  throughput_over_time.png        - products/min completed over time
-2.  workflows_pending_over_time.png - pending workflow count over time
-3.  workflows_running_over_time.png - running workflow count over time
-4.  e2e_latency_over_time.png       - end-to-end p50/p95 rolling latency
-5.  queue_time_over_time.png        - workflow queue time p50/p95 over time
-6.  step_duration_comparison.png    - per-step duration box plot / bar
-7.  step_cpu_peak.png               - per-step CPU peak (avg and max)
-8.  step_mem_peak.png               - per-step memory peak (avg and max)
+1.  throughput_over_time.png           - products/min completed over time
+2.  workflows_pending_over_time.png    - pending workflow count over time
+3.  workflows_running_over_time.png    - running workflow count over time
+4.  e2e_latency_over_time.png          - end-to-end p50/p95 rolling latency
+5.  queue_time_over_time.png           - workflow queue time p50/p95 over time
+6.  step_duration_comparison.png       - per-step duration box plot / bar
+7.  step_cpu_peak.png                  - per-step CPU peak (avg and max)
+8.  step_mem_peak.png                  - per-step memory peak (avg and max)
+9.  stac_publish_latency_histogram.png - distribution of stac_publish_sec
+                                         (omnipass_finished → properties.updated)
+10. pipeline_breakdown.png             - stacked bar per product showing time
+                                         split: dispatcher_run + pipeline_gap +
+                                         workflow_queue + workflow_run + stac_publish
 
 All plots are saved as PNG files in the output directory.
 Matplotlib's Agg backend is used so no display is required.
@@ -398,6 +403,164 @@ def plot_step_mem_peak(step_kpis: List[dict], output_dir: Path) -> Optional[Path
 
 
 # ---------------------------------------------------------------------------
+# Plot 9: STAC publish latency histogram
+# ---------------------------------------------------------------------------
+
+def plot_stac_publish_latency_histogram(
+    products: List[dict], output_dir: Path
+) -> Optional[Path]:
+    """
+    Histogram of stac_publish_sec (omnipass_finished → properties.updated).
+
+    This is the central KPI for re-ingestion: how long after the ingestor
+    completes does the STAC catalog reflect the updated item?
+
+    Vertical lines mark p50, p95, p99.
+    """
+    values = [
+        _safe_float(p.get("stac_publish_sec"))
+        for p in products
+        if _safe_float(p.get("stac_publish_sec")) is not None
+        and _safe_float(p.get("stac_publish_sec")) >= 0
+    ]
+
+    if not values:
+        logger.warning("No stac_publish_sec data for histogram")
+        return None
+
+    arr = np.array(values)
+    p50 = float(np.percentile(arr, 50))
+    p95 = float(np.percentile(arr, 95))
+    p99 = float(np.percentile(arr, 99))
+
+    fig, ax = plt.subplots(figsize=(_FIG_WIDTH, _FIG_HEIGHT))
+
+    n_bins = min(50, max(10, len(values) // 3))
+    ax.hist(arr, bins=n_bins, color=_COLOR_BAR, alpha=0.75, edgecolor="white", linewidth=0.5)
+
+    ax.axvline(p50, color=_COLOR_P50, linewidth=1.8, linestyle="-",
+               label=f"p50 = {p50:.1f}s")
+    ax.axvline(p95, color=_COLOR_P95, linewidth=1.8, linestyle="--",
+               label=f"p95 = {p95:.1f}s")
+    ax.axvline(p99, color="#9C27B0", linewidth=1.8, linestyle=":",
+               label=f"p99 = {p99:.1f}s")
+
+    ax.set_title(
+        "STAC Publish Latency Distribution\n"
+        "(omnipass_finished → properties.updated)",
+        fontsize=13, fontweight="bold",
+    )
+    ax.set_xlabel("stac_publish_sec (seconds)")
+    ax.set_ylabel("Number of products")
+    ax.legend()
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+
+    path = output_dir / "stac_publish_latency_histogram.png"
+    fig.savefig(path, dpi=_DPI)
+    plt.close(fig)
+    logger.info("Saved %s", path)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Plot 10: Pipeline time breakdown (stacked bar per product)
+# ---------------------------------------------------------------------------
+
+def plot_pipeline_breakdown(
+    products: List[dict], output_dir: Path, max_products: int = 60
+) -> Optional[Path]:
+    """
+    Stacked horizontal bar chart showing how total time is split across the
+    five pipeline phases for each product:
+
+      dispatcher_run  → pipeline_gap (Kafka latency)
+                      → workflow_queue (semaphore wait)
+                      → workflow_run (calrissian)
+                      → stac_publish (catalog update)
+
+    Products are sorted by end_to_end_sec descending so the slowest appear
+    at the top.  Capped at ``max_products`` for readability.
+    """
+    # Only include succeeded products with at least partial timing
+    candidates = [
+        p for p in products
+        if p.get("final_status") == "succeeded"
+        and any(
+            _safe_float(p.get(f)) is not None
+            for f in ("workflow_run_sec", "stac_publish_sec")
+        )
+    ]
+
+    if not candidates:
+        logger.warning("No succeeded products with timing data for pipeline breakdown")
+        return None
+
+    # Sort by end_to_end_sec desc; fall back to workflow_run_sec
+    def _sort_key(p):
+        v = _safe_float(p.get("end_to_end_sec")) or _safe_float(p.get("workflow_run_sec")) or 0
+        return v
+
+    candidates.sort(key=_sort_key, reverse=True)
+    if len(candidates) > max_products:
+        candidates = candidates[:max_products]
+
+    # Labels: use last segment of product_id for readability
+    labels = [str(p.get("product_id", "?"))[-24:] for p in candidates]
+
+    phases = [
+        ("dispatcher_run_sec",  "Dispatcher run",    "#42A5F5"),  # light blue
+        ("pipeline_gap_sec",    "Kafka latency",      "#FFA726"),  # orange
+        ("workflow_queue_sec",  "Semaphore wait",     "#EF5350"),  # red
+        ("workflow_run_sec",    "Calrissian (argo-cwl)", "#66BB6A"),  # green
+        ("stac_publish_sec",    "STAC publish",       "#AB47BC"),  # purple
+    ]
+
+    # Build matrix: rows=products, cols=phases
+    data = []
+    for field, _, _ in phases:
+        col = [max(0.0, _safe_float(p.get(field)) or 0.0) for p in candidates]
+        data.append(col)
+
+    n = len(candidates)
+    fig_height = max(5, n * 0.28 + 1.5)
+    fig, ax = plt.subplots(figsize=(_FIG_WIDTH, fig_height))
+
+    y = np.arange(n)
+    lefts = np.zeros(n)
+
+    for (field, label, color), col in zip(phases, data):
+        col_arr = np.array(col)
+        bars = ax.barh(y, col_arr, left=lefts, label=label, color=color, alpha=0.85)
+        # Annotate non-trivial segments (>2s) with their value
+        for i, (val, left) in enumerate(zip(col_arr, lefts)):
+            if val >= 2:
+                ax.text(
+                    left + val / 2, i, f"{val:.0f}s",
+                    ha="center", va="center", fontsize=6.5, color="white", fontweight="bold",
+                )
+        lefts = lefts + col_arr
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=7)
+    ax.set_xlabel("Elapsed time (seconds)")
+    ax.set_title(
+        "Pipeline Time Breakdown per Product\n"
+        "(dispatcher → Kafka → semaphore wait → calrissian → STAC publish)",
+        fontsize=12, fontweight="bold",
+    )
+    ax.legend(loc="lower right", fontsize=8)
+    ax.grid(True, axis="x", alpha=0.25)
+    fig.tight_layout()
+
+    path = output_dir / "pipeline_breakdown.png"
+    fig.savefig(path, dpi=_DPI)
+    plt.close(fig)
+    logger.info("Saved %s", path)
+    return path
+
+
+# ---------------------------------------------------------------------------
 # Generate all plots
 # ---------------------------------------------------------------------------
 
@@ -408,7 +571,7 @@ def generate_all_plots(
     step_kpis: List[dict],
 ) -> Dict[str, Optional[Path]]:
     """
-    Run all eight plot generators and return a dict of name -> file path.
+    Run all plot generators and return a dict of name -> file path.
     """
     plots_dir = output_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
@@ -422,6 +585,8 @@ def generate_all_plots(
     results["step_duration_comparison"] = plot_step_duration_comparison(step_kpis, plots_dir)
     results["step_cpu_peak"] = plot_step_cpu_peak(step_kpis, plots_dir)
     results["step_mem_peak"] = plot_step_mem_peak(step_kpis, plots_dir)
+    results["stac_publish_latency_histogram"] = plot_stac_publish_latency_histogram(products, plots_dir)
+    results["pipeline_breakdown"] = plot_pipeline_breakdown(products, plots_dir)
 
     generated = sum(1 for v in results.values() if v is not None)
     logger.info("Generated %d/%d plots in %s", generated, len(results), plots_dir)
