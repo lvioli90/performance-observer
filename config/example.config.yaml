@@ -34,10 +34,11 @@ argo:
   # it automatically falls back to pod-based workflow reconstruction using
   # only `pods: [get list watch]` — which is sufficient for most limited RBAC setups.
   # Set to "" to skip the REST API entirely and use pod-based mode from the start.
-  server_url: "https://workflows-uat.iride.earth:443"
-  # Bearer token from Argo UI → User Info → "Using Your Login With The CLI" → ARGO_TOKEN.
-  # Format: "Bearer v2:..." (copy the full value including the "Bearer " prefix).
-  # Not required when using pod-based mode (server_url = "").
+  # Pod-based mode: leave server_url empty to skip the Argo REST API entirely
+  # and go directly to workflow reconstruction from pod labels/annotations.
+  # The IRIDE UAT RBAC does not grant access to workflows.argoproj.io CRDs,
+  # so the REST API would return 403 anyway.
+  server_url: ""
   token: ""
   verify_tls: true
 
@@ -47,11 +48,13 @@ argo:
 kubernetes:
   pod_namespaces:
     - "datalake"
-  kubeconfig: ""    # empty = ~/.kube/config (standard location)
+  # Path to kubeconfig. Empty = ~/.kube/config.
+  # If you saved the UAT kubeconfig to a dedicated file, set the full path here:
+  #   kubeconfig: "/home/lvioli/kubeconfigs/uatmkpl.yaml"
+  kubeconfig: ""
   # Context name from `kubectl config get-contexts`.
-  # Required when running from a laptop with VPN access to the cluster.
-  # Leave empty to use the current active context.
-  context: ""       # e.g. "iride-uat" — fill in with your context name
+  # Rancher/RKE2 UAT context as configured in the kubeconfig above.
+  context: "uatmkpl"
 
 # --------------------------------------------------------
 # STAC catalog
