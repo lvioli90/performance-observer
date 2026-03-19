@@ -91,15 +91,27 @@ class Correlator:
     # Main entry point
     # ------------------------------------------------------------------
 
-    def correlate_workflow(self, wf: WorkflowRecord) -> Optional[str]:
+    def correlate_workflow(
+        self,
+        wf: WorkflowRecord,
+        minio_collector=None,
+    ) -> Optional[str]:
         """
         Determine product_id for a workflow and upsert the ProductRecord.
+
+        Parameters
+        ----------
+        wf : WorkflowRecord
+        minio_collector : MinioArtifactCollector or None
+            If provided and this is a dispatcher workflow, fetch T0 from
+            MinIO stat_object immediately after correlation.
+
         Returns product_id if found, None otherwise.
         """
         wf_type = self._detect_workflow_type(wf)
         if wf_type is None:
             logger.debug(
-                "Unknown workflow type for %s (template=%s); skipping correlation",
+                "Unknown workflow type for %s (template=%s); skipping",
                 wf.workflow_name, wf.template_name,
             )
             return None
@@ -111,15 +123,50 @@ class Correlator:
             product_id = self._correlate_omnipass(wf)
 
         if product_id is None:
-            logger.debug(
-                "No correlation for %s workflow %s",
-                wf_type, wf.workflow_name,
-            )
+            logger.debug("No correlation for %s wf=%s", wf_type, wf.workflow_name)
             return None
 
         wf.product_id = product_id
         self._upsert_product(product_id, wf, wf_type)
+
+        # Resolve true T0 from MinIO stat_object immediately after dispatcher correlation.
+        # T0 = LastModified of the object in the drop-bucket = most accurate ingest time.
+        if wf_type == _DISPATCHER and minio_collector is not None:
+            self._resolve_t0(product_id, wf, minio_collector)
+
         return product_id
+
+    def _resolve_t0(self, product_id: str, wf: WorkflowRecord, minio_collector) -> None:
+        """
+        Fetch true T0 (MinIO object LastModified) and set ingest_reference_time
+        on the ProductRecord.  Called once per product after dispatcher correlation.
+        """
+        s3_key = wf.parameters.get(self.ctx.corr_dispatcher_s3_key_param, "")
+        s3_bucket = wf.parameters.get(
+            self.ctx.corr_dispatcher_s3_bucket_param, "drop-bucket"
+        )
+        if not s3_key:
+            return
+
+        t0 = minio_collector.fetch_ingest_time(product_id, s3_key, s3_bucket)
+        if t0 is None:
+            return   # falls back to dispatcher.created_at set in _update_from_dispatcher
+
+        with self.ctx._lock:
+            product = self.ctx.products.get(product_id)
+            if product is not None:
+                product.ingest_reference_time = t0
+                self.ctx._products_dirty.append(product_id)
+                logger.info(
+                    "T0 set from MinIO stat: product_id=%s T0=%s "
+                    "(dispatcher.created_at was %s, delta=%.1fs)",
+                    product_id,
+                    t0.isoformat(),
+                    product.dispatcher_created_at.isoformat()
+                    if product.dispatcher_created_at else "N/A",
+                    (product.dispatcher_created_at - t0).total_seconds()
+                    if product.dispatcher_created_at else float("nan"),
+                )
 
     # ------------------------------------------------------------------
     # Workflow type detection

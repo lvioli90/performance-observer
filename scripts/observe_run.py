@@ -128,14 +128,19 @@ def _workflow_loop(
     argo: ArgoCollector,
     correlator: Correlator,
     pm: PersistenceManager,
+    minio_collector=None,
 ) -> None:
-    """Polls Argo workflows and runs correlation on a fixed interval."""
+    """
+    Polls Argo workflows, runs correlation, and resolves T0 from MinIO.
+    T0 = LastModified of the drop-bucket object (true ingest time).
+    Falls back to dispatcher.created_at when MinIO is unavailable.
+    """
     logger = logging.getLogger("observer.workflow_loop")
     while not ctx.stop_event.is_set():
         try:
             records = argo.poll()
             for wf in records:
-                correlator.correlate_workflow(wf)
+                correlator.correlate_workflow(wf, minio_collector=minio_collector)
             pm.flush_dirty_workflows(ctx)
             pm.flush_dirty_products(ctx)
         except Exception as exc:
@@ -334,7 +339,7 @@ def main() -> None:
     # Launch background threads
     threads = [
         threading.Thread(
-            target=_workflow_loop, args=(ctx, argo, correlator, pm),
+            target=_workflow_loop, args=(ctx, argo, correlator, pm, minio_col),
             name="workflow-loop", daemon=True
         ),
         threading.Thread(

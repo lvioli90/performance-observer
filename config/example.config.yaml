@@ -71,8 +71,12 @@ minio:
   endpoint: "http://minio.datalake.svc:9000"   # PLUG-IN: real MinIO endpoint
   access_key: ""                                # PLUG-IN: access key
   secret_key: ""                                # PLUG-IN: secret key
-  # The bucket where Argo stores workflow artifacts (matches Argo artifact repo config).
+  # Bucket where Argo stores workflow artifacts (matches Argo artifact repository config).
   artifact_bucket: "argo-artifacts"            # PLUG-IN: real artifact bucket
+  # Drop bucket: where ingested products are deposited (stat_object → true T0).
+  # Must match the dispatcher's s3-bucket parameter (default "drop-bucket").
+  # If empty, T0 falls back to dispatcher workflow_created_at.
+  drop_bucket: "drop-bucket"
   secure: false
 
 # --------------------------------------------------------

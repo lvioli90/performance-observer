@@ -1,48 +1,62 @@
 """
 collectors/minio_artifact.py
 =============================
-Reads the kafka-message.json artifact written by the ingestor-omnipass
-exit-handler to MinIO after each successful (or failed) workflow run.
+Two responsibilities using the same MinIO connection:
 
-Why this exists
----------------
-The omnipass exit-handler writes:
-  s3://{artifact_bucket}/{workflow.uid}/kafka-message.json
+1. T0 RESOLUTION — fetch_ingest_time()
+   ─────────────────────────────────────
+   The true T0 (product dropped into MinIO) is the LastModified timestamp
+   of the object in the drop-bucket.  We read it via stat_object() using
+   the s3-key from the dispatcher workflow parameter.
 
-On SUCCESS the file contains:
-  {
-    "exit_code": "0",
-    "stac_url": "https://discover-uat.iride.earth/collections/{coll}/items/{item_id}",
-    "stac_item": {
-      "id": "<stac item id>",
-      "collection": "<collection name>",
-      ...full STAC item...
-    }
-  }
+   Timeline of the full pipeline:
+     T0  Object written to MinIO drop-bucket       ← LastModified (this method)
+      ↓  MinIO event → Argo webhook latency (~seconds)
+     T1  ingestion-dispatcher workflow created      ← dispatcher.created_at
+      ↓  dispatcher queue + run (~seconds)
+     T2  dispatcher finished → Kafka dispatched
+      ↓  Kafka latency + omnipass scheduling (pipeline_gap_sec)
+     T3  ingestor-omnipass created
+      ↓  omnipass queue (semaphore wait)
+     T4  omnipass started
+      ↓  omnipass run (~minutes, calrissian CWL)
+     T5  omnipass finished
+      ↓  STAC publish latency
+     T6  STAC item visible
 
-On FAILURE:
-  {
-    "exit_code": "1",
-    "error": "<error message>"
-  }
+   Without T0: end_to_end = T6 - T1  (misses MinIO event latency T0→T1)
+   With T0:    end_to_end = T6 - T0  (true end-to-end, most accurate)
 
-This is the ONLY reliable way to get the exact STAC item id and collection
-without guessing, because the calrissian CWL tool determines both values
-at runtime and the observer has no other hook to read them.
+   T0→T1 (event notification latency) is usually small (<5s at low load)
+   but may grow under stress — worth knowing for a proper soak test.
 
-Strategy
---------
-1. After an omnipass workflow reaches Succeeded or Failed phase, its
-   workflow.uid is known.
-2. This collector reads the artifact at {uid}/kafka-message.json.
-3. On success: extract stac_url, stac_item.id, stac_item.collection.
-4. Update the ProductRecord via the Correlator.
+2. STAC ITEM DISCOVERY — poll()
+   ─────────────────────────────
+   After ingestor-omnipass completes, its exit-handler writes:
+     s3://{artifact_bucket}/{workflow.uid}/kafka-message.json
 
-Plug-in points
---------------
-- Requires the `minio` Python package: pip install minio
-- minio.* credentials must be set in config.
-- The artifact_bucket must match Argo's artifact repository config.
+   On SUCCESS:
+     {"exit_code": "0",
+      "stac_url": "https://discover-uat.iride.earth/collections/{coll}/items/{id}",
+      "stac_item": {"id": "...", "collection": "...", ...}}
+
+   On FAILURE:
+     {"exit_code": "1", "error": "..."}
+
+   This is the only reliable source of the exact STAC item id and collection
+   (the calrissian CWL tool determines them at runtime).
+
+Configuration required (minio.* section in config YAML):
+  endpoint:        e.g. "http://minio.datalake.svc:9000"
+  access_key:      MinIO access key
+  secret_key:      MinIO secret key
+  artifact_bucket: Argo artifact repository bucket name
+  drop_bucket:     MinIO drop-bucket name (for stat_object T0 reads)
+                   default: "drop-bucket" (from dispatcher s3-bucket parameter)
+  secure:          false for HTTP, true for HTTPS
+
+Dependencies:
+  pip install minio
 """
 
 from __future__ import annotations
@@ -59,159 +73,187 @@ logger = logging.getLogger(__name__)
 
 class MinioArtifactCollector:
     """
-    Polls completed omnipass workflows and reads their kafka-message.json
-    artifact from MinIO to discover the actual STAC item id and collection.
-
-    Only omnipass workflows in Succeeded or Failed state are checked.
-    Each workflow_uid is only checked once (tracked in _checked_uids).
+    Uses MinIO for two purposes:
+      1. stat_object() on the drop-bucket to get true T0 per product
+      2. get_object() on the artifact bucket for STAC item discovery
     """
 
     def __init__(self, ctx: RunContext):
         self.ctx = ctx
-        self._checked_uids: Set[str] = set()
-        self._minio_client = None
+        # workflow_name → already checked (dedup for artifact reads)
+        self._artifact_checked: Set[str] = set()
+        # product_id → already fetched T0 (dedup for stat_object reads)
+        self._t0_fetched: Set[str] = set()
+        self._client = None
+
+    # ------------------------------------------------------------------
+    # MinIO client (lazy init, shared for both T0 and artifact reads)
+    # ------------------------------------------------------------------
 
     def _ensure_client(self) -> bool:
-        """Lazy-init the MinIO client. Returns True if client is available."""
-        if self._minio_client is not None:
+        if self._client is not None:
             return True
         if not self.ctx.minio_endpoint:
-            logger.debug("MinIO endpoint not configured; artifact reading disabled")
+            logger.debug("MinIO endpoint not configured; T0 and artifact reading disabled")
             return False
         try:
             from minio import Minio
-            self._minio_client = Minio(
-                endpoint=self.ctx.minio_endpoint.replace("http://", "").replace("https://", ""),
+            endpoint = (
+                self.ctx.minio_endpoint
+                .replace("http://", "")
+                .replace("https://", "")
+            )
+            self._client = Minio(
+                endpoint=endpoint,
                 access_key=self.ctx.minio_access_key or None,
                 secret_key=self.ctx.minio_secret_key or None,
                 secure=self.ctx.minio_secure,
             )
-            logger.debug("MinIO client initialized: endpoint=%s", self.ctx.minio_endpoint)
+            logger.info("MinIO client initialized: %s", self.ctx.minio_endpoint)
             return True
         except ImportError:
-            logger.warning(
-                "minio package not installed; artifact reading disabled. "
-                "Run: pip install minio"
-            )
+            logger.warning("minio package not installed. Run: pip install minio")
             return False
         except Exception as exc:
             logger.warning("MinIO client init failed: %s", exc)
             return False
 
+    # ------------------------------------------------------------------
+    # 1. T0 resolution: stat_object on drop-bucket
+    # ------------------------------------------------------------------
+
+    def fetch_ingest_time(self, product_id: str, s3_key: str, s3_bucket: str) -> Optional[datetime]:
+        """
+        Return the true T0 for a product: the LastModified timestamp of the
+        object in the MinIO drop-bucket.
+
+        This is called by the workflow loop after the dispatcher workflow
+        is first correlated (s3_key and s3_bucket are available from dispatcher
+        parameters at that point).
+
+        Parameters
+        ----------
+        product_id : str
+            Used for deduplication (only fetch T0 once per product).
+        s3_key : str
+            The relative object key, e.g. "path/to/product.zip"
+        s3_bucket : str
+            The bucket name from the dispatcher s3-bucket parameter.
+
+        Returns
+        -------
+        datetime (UTC) or None if not accessible.
+        """
+        if product_id in self._t0_fetched:
+            return None   # already fetched; caller should read from ProductRecord
+        if not self._ensure_client():
+            return None
+
+        self._t0_fetched.add(product_id)
+        try:
+            stat = self._client.stat_object(s3_bucket, s3_key)
+            t0 = stat.last_modified
+            # minio returns timezone-aware datetime; ensure UTC
+            if t0.tzinfo is None:
+                t0 = t0.replace(tzinfo=timezone.utc)
+            logger.debug(
+                "T0 resolved: product_id=%s bucket=%s key=%s last_modified=%s",
+                product_id, s3_bucket, s3_key, t0.isoformat(),
+            )
+            return t0
+        except Exception as exc:
+            # Object may have been deleted or key is wrong
+            logger.warning(
+                "stat_object failed for s3://%s/%s (product=%s): %s",
+                s3_bucket, s3_key, product_id, exc,
+            )
+            return None
+
+    # ------------------------------------------------------------------
+    # 2. STAC discovery: read kafka-message.json artifact
+    # ------------------------------------------------------------------
+
     def poll(self, correlator) -> int:
         """
-        Check completed omnipass workflows for unread artifacts.
-
-        For each new completed omnipass workflow (not yet in _checked_uids):
-          1. Derive the artifact S3 key: {workflow_uid}/kafka-message.json
-          2. Read and parse the artifact from MinIO
-          3. Update the ProductRecord via correlator
-
-        Returns number of artifacts successfully read.
+        Check completed omnipass workflows for unread kafka-message.json artifacts.
+        Returns number of artifacts successfully processed.
         """
         if not self.ctx.corr_use_artifact_stac:
             return 0
         if not self._ensure_client():
             return 0
 
-        # Find completed omnipass workflows not yet processed.
-        # Use workflow_name as the dedup key (uid may be None if not yet parsed).
         omnipass_kw = self.ctx.corr_omnipass_template.lower()
-        completed_omnipass = [
+        candidates = [
             wf for wf in self.ctx.snapshot_workflows()
             if omnipass_kw in (wf.template_name or wf.workflow_name).lower()
             and wf.phase in ("Succeeded", "Failed")
-            and wf.workflow_name not in self._checked_uids
+            and wf.workflow_name not in self._artifact_checked
             and wf.product_id is not None
-            and wf.uid is not None   # uid required for artifact path
+            and wf.uid is not None
         ]
 
-        if not completed_omnipass:
+        if not candidates:
             return 0
 
         processed = 0
-        for wf in completed_omnipass:
-            self._checked_uids.add(wf.workflow_name)
+        for wf in candidates:
+            self._artifact_checked.add(wf.workflow_name)
             try:
-                artifact = self._read_artifact(wf.workflow_name)
+                artifact = self._read_artifact(wf)
                 if artifact is None:
+                    # Not yet written — remove from checked so we retry next poll
+                    self._artifact_checked.discard(wf.workflow_name)
                     continue
                 self._process_artifact(wf, artifact, correlator)
                 processed += 1
             except Exception as exc:
-                logger.warning(
-                    "Artifact read failed for workflow %s: %s",
-                    wf.workflow_name, exc,
-                )
+                logger.warning("Artifact processing failed for %s: %s", wf.workflow_name, exc)
 
         if processed:
-            logger.info("MinIO artifact poll: %d artifacts read", processed)
+            logger.info("Artifact poll: %d kafka-message.json artifacts read", processed)
         return processed
 
-    def _read_artifact(self, workflow_name: str) -> Optional[dict]:
+    def _read_artifact(self, wf) -> Optional[dict]:
         """
-        Read the kafka-message.json artifact for a given workflow.
-
-        Artifact key = {workflow.uid}/kafka-message.json
-        The uid is the Kubernetes UUID from metadata.uid (NOT the workflow name).
-        This matches the template:  s3: key: "{{workflow.uid}}/kafka-message.json"
+        Fetch {workflow.uid}/kafka-message.json from the Argo artifact bucket.
+        Returns None if the object does not yet exist (exit-handler still running).
         """
         bucket = self.ctx.minio_artifact_bucket
-        # uid is stored on WorkflowRecord; caller passes workflow_name but we
-        # look up the uid from the in-memory store.
-        wf = self.ctx.workflows.get(workflow_name)
-        uid = wf.uid if wf else None
-        if not uid:
-            logger.debug("No uid for workflow %s; cannot read artifact", workflow_name)
-            return None
-        artifact_key = f"{uid}/kafka-message.json"
-
+        artifact_key = f"{wf.uid}/kafka-message.json"
         try:
-            response = self._minio_client.get_object(bucket, artifact_key)
+            response = self._client.get_object(bucket, artifact_key)
             data = response.read()
             response.close()
             response.release_conn()
             return json.loads(data)
         except Exception as exc:
-            # Object may not exist yet (e.g., exit-handler still running)
-            err_str = str(exc).lower()
-            if "nosuchkey" in err_str or "no such key" in err_str or "does not exist" in err_str:
-                logger.debug(
-                    "Artifact not yet available: bucket=%s key=%s",
-                    bucket, artifact_key,
-                )
-            else:
-                logger.warning("MinIO get_object error: %s", exc)
+            if _is_not_found(exc):
+                logger.debug("Artifact not yet available: %s/%s", bucket, artifact_key)
+                return None
+            logger.warning("get_object error for %s/%s: %s", bucket, artifact_key, exc)
             return None
 
     def _process_artifact(self, wf, artifact: dict, correlator) -> None:
-        """
-        Parse the kafka-message.json and update the ProductRecord.
-
-        Success artifact schema:
-          {"exit_code": "0", "stac_url": "...", "stac_item": {"id": ..., "collection": ...}}
-
-        Failure artifact schema:
-          {"exit_code": "1", "error": "..."}
-        """
-        exit_code = str(artifact.get("exit_code", "1"))
+        """Parse kafka-message.json and update ProductRecord via correlator."""
         product_id = wf.product_id
         seen_at = datetime.now(timezone.utc)
+        exit_code = str(artifact.get("exit_code", "1"))
 
         if exit_code == "0":
             stac_url = artifact.get("stac_url", "")
             stac_item = artifact.get("stac_item") or {}
-            item_id = stac_item.get("id") or self._extract_item_id_from_url(stac_url)
+            item_id = stac_item.get("id") or _item_id_from_url(stac_url)
             collection_id = stac_item.get("collection", "")
 
             if not item_id:
                 logger.warning(
-                    "Artifact for %s has exit_code=0 but no stac item id", wf.workflow_name
+                    "Artifact for %s: exit_code=0 but no STAC item id found", product_id
                 )
                 return
 
             logger.info(
-                "STAC item from artifact: product=%s collection=%s item_id=%s",
+                "STAC from artifact: product=%s collection=%s item_id=%s",
                 product_id, collection_id, item_id,
             )
             correlator.update_stac_from_artifact(
@@ -223,25 +265,29 @@ class MinioArtifactCollector:
             )
         else:
             error_msg = artifact.get("error", "unknown")
-            logger.debug(
-                "Artifact for product=%s shows failure: %s", product_id, error_msg
-            )
-            # Update final_status if workflow shows failure in artifact
+            logger.debug("Artifact for product=%s shows failure: %s", product_id, error_msg)
             with self.ctx._lock:
                 product = self.ctx.products.get(product_id)
                 if product and product.final_status == "in_progress":
                     product.final_status = "failed"
                     self.ctx._products_dirty.append(product_id)
 
-    @staticmethod
-    def _extract_item_id_from_url(stac_url: str) -> Optional[str]:
-        """
-        Extract item_id from a STAC URL of the form:
-        https://host/collections/{collection}/items/{item_id}
-        """
-        if not stac_url:
-            return None
-        parts = stac_url.rstrip("/").split("/")
-        if len(parts) >= 2 and parts[-2] == "items":
-            return parts[-1]
+
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
+
+def _is_not_found(exc: Exception) -> bool:
+    """Return True if the MinIO exception means the object doesn't exist yet."""
+    msg = str(exc).lower()
+    return any(k in msg for k in ("nosuchkey", "no such key", "does not exist", "404"))
+
+
+def _item_id_from_url(stac_url: str) -> Optional[str]:
+    """Extract item_id from .../collections/{coll}/items/{item_id}"""
+    if not stac_url:
         return None
+    parts = stac_url.rstrip("/").split("/")
+    if len(parts) >= 2 and parts[-2] == "items":
+        return parts[-1]
+    return None
