@@ -200,6 +200,10 @@ class StacRecord:
     # Snapshot of relevant STAC item fields at first observation
     stac_datetime: Optional[str] = None
     stac_bbox: Optional[list] = None
+    # properties.updated from the STAC item — the catalog's own publication timestamp.
+    # For re-ingested products this changes when the item is re-published; we compare it
+    # against workflow_finished_at to detect a successful re-ingestion cycle.
+    stac_updated: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

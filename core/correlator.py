@@ -403,10 +403,22 @@ class Correlator:
         stac_url: Optional[str] = None,
     ) -> None:
         """
-        Update the ProductRecord with STAC visibility info sourced from the
-        omnipass kafka-message.json artifact (the most reliable source).
+        Register STAC coordinates (item_id, collection) discovered from the
+        omnipass kafka-message.json artifact.
 
         Called by collectors/minio_artifact.py after reading the artifact.
+
+        IMPORTANT — re-ingestion semantics:
+        The artifact tells us *which* STAC item was written, but NOT when the
+        STAC catalog actually reflected the update.  For re-ingested products
+        the item already exists in the catalog, so finding it is not proof of
+        publication.  The authoritative signal is ``properties.updated`` from
+        the STAC API, which the StacCollector checks on every polling cycle.
+
+        Therefore this method only stores the STAC coordinates in a StacRecord
+        and does NOT set ``product.stac_seen_at``.  The StacCollector will set
+        ``stac_seen_at`` once it confirms that ``properties.updated`` is past
+        ``workflow_finished_at``.
         """
         from core.models import StacRecord
 
@@ -415,21 +427,17 @@ class Correlator:
             product_id=product_id,
             stac_item_id=stac_item_id,
             collection_id=collection_id,
-            first_seen_at=stac_seen_at,
-            verification_status="found",
+            first_seen_at=None,        # set by StacCollector after verifying properties.updated
+            verification_status="pending_update_check",
+            discovery_method="artifact",
             stac_url=stac_url,
         )
         self.ctx.add_or_update_stac(stac_record)
-
-        with self.ctx._lock:
-            product = self.ctx.products.get(product_id)
-            if product and product.stac_seen_at is None:
-                product.stac_seen_at = stac_seen_at
-                self.ctx._products_dirty.append(product_id)
-                logger.debug(
-                    "STAC visibility from artifact: product_id=%s item_id=%s collection=%s",
-                    product_id, stac_item_id, collection_id,
-                )
+        logger.debug(
+            "STAC coordinates registered from artifact: product_id=%s item_id=%s collection=%s"
+            " (stac_seen_at deferred to StacCollector)",
+            product_id, stac_item_id, collection_id,
+        )
 
     # ------------------------------------------------------------------
     # STAC update from polling
