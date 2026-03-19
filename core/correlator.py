@@ -230,6 +230,12 @@ class Correlator:
           s3-bucket = "drop-bucket"
           object_key = "s3://drop-bucket/path/to/S2A_MSIL2A_20230101.zip"
           product_id = "S2A_MSIL2A_20230101"
+
+        Fallback chain (each step tried only if the previous returns nothing):
+          1. Pod annotation params (s3-key / s3-bucket)
+          2. Drop-watcher time-window match
+          3. Nearest drop event regardless of time (works when observer started late)
+          4. Workflow name itself as product_id (last resort, always succeeds)
         """
         s3_key_param = self.ctx.corr_dispatcher_s3_key_param
         s3_bucket_param = self.ctx.corr_dispatcher_s3_bucket_param
@@ -238,31 +244,42 @@ class Correlator:
         s3_bucket = wf.parameters.get(s3_bucket_param, "drop-bucket")
 
         if not s3_key:
-            # Fallback: match against MinIO drop-watcher events by time-window.
-            # Needed when pod annotations don't carry workflow-level parameters.
+            # Fallback 2: time-window match
             s3_key, s3_bucket_from_event = self._s3_key_from_drop_events(wf)
             if s3_key:
                 s3_bucket = s3_bucket_from_event or s3_bucket
                 logger.info(
-                    "Dispatcher %s: '%s' not in pod params — resolved from drop-watcher: %s",
+                    "Dispatcher %s: '%s' not in params — from drop-watcher (window): %s",
                     wf.workflow_name, s3_key_param, s3_key,
                 )
             else:
-                logger.debug(
-                    "Dispatcher %s has no '%s' parameter and no drop-watcher match",
-                    wf.workflow_name, s3_key_param,
+                # Fallback 3: nearest drop event, ignoring time window
+                s3_key, s3_bucket_from_event = self._s3_key_nearest_drop_event(wf)
+                if s3_key:
+                    s3_bucket = s3_bucket_from_event or s3_bucket
+                    logger.info(
+                        "Dispatcher %s: no params, no window match — "
+                        "using nearest drop event: %s",
+                        wf.workflow_name, s3_key,
+                    )
+
+        if s3_key:
+            wf.object_key = f"s3://{s3_bucket}/{s3_key}"
+            product_id = self._extract_product_id_from_s3_key(s3_key)
+            if product_id:
+                logger.info(
+                    "Dispatcher correlated: wf=%s s3_key=%s product_id=%s",
+                    wf.workflow_name, s3_key, product_id,
                 )
-                return None
+                return product_id
 
-        s3_url = f"s3://{s3_bucket}/{s3_key}"
-        wf.object_key = s3_url
-
-        product_id = self._extract_product_id_from_s3_key(s3_key)
-        if product_id:
-            logger.info(
-                "Dispatcher correlated: wf=%s s3_key=%s product_id=%s",
-                wf.workflow_name, s3_key, product_id,
-            )
+        # Fallback 4: use workflow name — always produces a stable identifier.
+        # product_id will be updated later if the artifact provides a better name.
+        product_id = wf.workflow_name
+        logger.info(
+            "Dispatcher %s: no s3-key available — using workflow name as product_id",
+            wf.workflow_name,
+        )
         return product_id
 
     # ------------------------------------------------------------------
@@ -277,26 +294,40 @@ class Correlator:
           object_key = reference (stored as-is)
           s3_key extracted = "path/to/S2A_MSIL2A_20230101.zip"
           product_id = "S2A_MSIL2A_20230101"
+
+        Fallback chain:
+          1. Pod annotation params (reference)
+          2. Dispatcher timing time-window match
+          3. Any unclaimed dispatcher product (for dryrun with 1 product)
         """
         reference_param = self.ctx.corr_omnipass_reference_param
         reference = wf.parameters.get(reference_param, "")
 
         if not reference:
-            # Fallback: match against a dispatcher ProductRecord by time-window.
-            # Needed when pod annotations don't carry workflow-level parameters.
+            # Fallback 2: time-window match
             product_id = self._product_id_from_dispatcher_timing(wf)
             if product_id:
                 logger.info(
-                    "Omnipass %s: '%s' not in pod params — matched product_id=%s "
-                    "from dispatcher timing",
+                    "Omnipass %s: no '%s' param — matched product_id=%s from dispatcher timing",
                     wf.workflow_name, reference_param, product_id,
                 )
-            else:
-                logger.debug(
-                    "Omnipass %s has no '%s' parameter and no dispatcher match",
-                    wf.workflow_name, reference_param,
+                return product_id
+
+            # Fallback 3: any unclaimed dispatcher product (works for 1-product dryrun)
+            product_id = self._product_id_any_unclaimed_dispatcher()
+            if product_id:
+                logger.info(
+                    "Omnipass %s: no params, no timing match — "
+                    "linked to sole unclaimed dispatcher product_id=%s",
+                    wf.workflow_name, product_id,
                 )
-            return product_id
+                return product_id
+
+            logger.debug(
+                "Omnipass %s: no '%s' parameter and no dispatcher product to match",
+                wf.workflow_name, reference_param,
+            )
+            return None
 
         wf.object_key = reference
 
@@ -363,6 +394,42 @@ class Correlator:
                 best_delta = delta
                 best_id = prod.product_id
         return best_id
+
+    def _s3_key_nearest_drop_event(
+        self, wf: WorkflowRecord
+    ) -> tuple:
+        """
+        Return the closest drop-watcher event to wf.created_at with NO time constraint.
+        Used as a last resort when the time-window fallback finds nothing — typically
+        because the observer started after the product was already dropped.
+        Only triggers when there is exactly 1 drop event (safe for dryrun).
+        """
+        with self.ctx._lock:
+            events = dict(self.ctx.drop_bucket_events)
+        if not events:
+            return ("", "")
+        if len(events) == 1:
+            # Single-product dryrun: one event = one product, no ambiguity.
+            s3_key = next(iter(events))
+            return (s3_key, self.ctx.minio_drop_bucket)
+        if wf.created_at is None:
+            return ("", "")
+        # Multiple events: return the closest one without any time constraint.
+        best_key = min(events, key=lambda k: abs((wf.created_at - events[k]).total_seconds()))
+        return (best_key, self.ctx.minio_drop_bucket)
+
+    def _product_id_any_unclaimed_dispatcher(self) -> Optional[str]:
+        """
+        Return the product_id of any dispatcher-created ProductRecord that has
+        not yet been claimed by an omnipass workflow.
+        Safe for dryrun (1 product) where timing may prevent the window match.
+        """
+        with self.ctx._lock:
+            products = list(self.ctx.products.values())
+        unclaimed = [p for p in products if p.dispatcher_workflow_name and not p.workflow_name]
+        if len(unclaimed) == 1:
+            return unclaimed[0].product_id
+        return None
 
     # ------------------------------------------------------------------
     # Regex helpers
