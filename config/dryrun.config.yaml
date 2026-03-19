@@ -54,8 +54,8 @@ minio:
   drop_bucket: "datalake-uat-drop-bucket"
   drop_prefix: ""
   drop_poll_sec: 10          # more aggressive for dry run
-  drop_lookback_sec: 60
-  drop_orphan_sec: 120
+  drop_lookback_sec: 600     # 10 min — catches products dropped before observer started
+  drop_orphan_sec: 300
   secure: true
 
 # --------------------------------------------------------
@@ -91,7 +91,7 @@ correlation:
   product_id_from_s3_key: "(?P<product_id>[^/]+?)(?:\\.zip|\\.tar\\.gz|\\.tgz|\\.nc|\\.h5)?$"
   stac_item_id_from_product_id: "{product_id}"
   use_artifact_stac_discovery: true
-  time_window_fallback_sec: 60
+  time_window_fallback_sec: 300  # 5 min — generous for slow Kafka/trigger latency
 
 # --------------------------------------------------------
 # Step tracking

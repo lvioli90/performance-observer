@@ -203,8 +203,9 @@ class MinioArtifactCollector:
             if omnipass_kw in (wf.template_name or wf.workflow_name).lower()
             and wf.phase in ("Succeeded", "Failed")
             and wf.workflow_name not in self._artifact_checked
-            and wf.product_id is not None
             and wf.uid is not None
+            # Note: wf.product_id may be None if correlation hasn't run yet;
+            # we still attempt to read the artifact and use stac_item_id as fallback.
         ]
 
         if not candidates:
@@ -250,7 +251,6 @@ class MinioArtifactCollector:
 
     def _process_artifact(self, wf, artifact: dict, correlator) -> None:
         """Parse kafka-message.json and update ProductRecord via correlator."""
-        product_id = wf.product_id
         seen_at = datetime.now(timezone.utc)
         exit_code = str(artifact.get("exit_code", "1"))
 
@@ -262,9 +262,22 @@ class MinioArtifactCollector:
 
             if not item_id:
                 logger.warning(
-                    "Artifact for %s: exit_code=0 but no STAC item id found", product_id
+                    "Artifact for wf=%s: exit_code=0 but no STAC item id found",
+                    wf.workflow_name,
                 )
                 return
+
+            # Use the correlated product_id if available; fall back to stac item_id.
+            # This handles the case where correlation failed but the artifact succeeded —
+            # the STAC item_id becomes the product identifier (safe for dryrun).
+            product_id = wf.product_id or item_id
+            if wf.product_id is None:
+                logger.info(
+                    "Artifact for wf=%s: no correlated product_id — "
+                    "using stac_item_id as product_id: %s",
+                    wf.workflow_name, product_id,
+                )
+                wf.product_id = product_id
 
             logger.info(
                 "STAC from artifact: product=%s collection=%s item_id=%s",
@@ -278,13 +291,16 @@ class MinioArtifactCollector:
                 stac_url=stac_url,
             )
         else:
+            product_id = wf.product_id
             error_msg = artifact.get("error", "unknown")
-            logger.debug("Artifact for product=%s shows failure: %s", product_id, error_msg)
-            with self.ctx._lock:
-                product = self.ctx.products.get(product_id)
-                if product and product.final_status == "in_progress":
-                    product.final_status = "failed"
-                    self.ctx._products_dirty.append(product_id)
+            logger.debug("Artifact for wf=%s product=%s shows failure: %s",
+                         wf.workflow_name, product_id, error_msg)
+            if product_id:
+                with self.ctx._lock:
+                    product = self.ctx.products.get(product_id)
+                    if product and product.final_status == "in_progress":
+                        product.final_status = "failed"
+                        self.ctx._products_dirty.append(product_id)
 
 
 # ------------------------------------------------------------------
