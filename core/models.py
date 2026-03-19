@@ -31,6 +31,11 @@ class WorkflowRecord:
     workflow_name: str
     namespace: str
 
+    # Kubernetes UID (UUID format, e.g. "9acd3eb9-9b3d-4b00-a64f-1ac37b556f4a").
+    # IMPORTANT: Argo artifact paths use {{workflow.uid}}, NOT workflow.name.
+    # MinIO artifact key = "{uid}/kafka-message.json"
+    uid: Optional[str] = None
+
     # Phase reported by Argo: Pending | Running | Succeeded | Failed | Error
     phase: str = "Unknown"
 
@@ -108,40 +113,62 @@ class ProductRecord:
     """
     Correlated end-to-end view for a single ingested product.
 
-    ingest_reference_time approximation strategy
-    --------------------------------------------
-    Because the observer does not control injection, it cannot observe the
-    exact moment a product was written to MinIO.  The approximation used here
-    is workflow_created_at (the moment Argo created the workflow), which is the
-    earliest observable timestamp and is usually within a few seconds of the
-    MinIO event trigger.  This can be overridden by setting the
-    ingest_reference_time field directly when a better source is available
-    (e.g. a workflow parameter that carries the object creation timestamp).
+    Two-workflow pipeline
+    ---------------------
+    Each product goes through two sequential Argo workflows:
+      1. ingestion-dispatcher  (fast: dispatches the job, seconds)
+      2. ingestor-omnipass     (heavy: runs calrissian CWL, minutes)
+
+    Both workflows carry the same S3 object key:
+      dispatcher:  s3-key parameter = "path/to/product.zip"
+      omnipass:    reference parameter = "s3://drop-bucket/path/to/product.zip"
+
+    ingest_reference_time
+    ---------------------
+    Set to dispatcher_created_at (earliest observable event, closest to the
+    actual MinIO drop). Falls back to omnipass created_at if dispatcher is
+    not observed.
     """
 
     run_id: str
     product_id: str
 
-    object_key: Optional[str] = None
-    workflow_name: Optional[str] = None
+    object_key: Optional[str] = None   # = s3://bucket/key (full S3 URL)
 
-    # Timestamps
+    # --- Dispatcher workflow fields ---
+    dispatcher_workflow_name: Optional[str] = None
+    dispatcher_created_at: Optional[datetime] = None
+    dispatcher_started_at: Optional[datetime] = None
+    dispatcher_finished_at: Optional[datetime] = None
+    dispatcher_status: Optional[str] = None   # Succeeded | Failed | ...
+
+    # --- Omnipass ingestor workflow fields ---
+    # "workflow_*" fields refer to the omnipass workflow (the heavy one)
+    workflow_name: Optional[str] = None
     workflow_created_at: Optional[datetime] = None
     workflow_started_at: Optional[datetime] = None
     workflow_finished_at: Optional[datetime] = None
+
+    # --- STAC visibility ---
     stac_seen_at: Optional[datetime] = None
 
-    # ingest_reference_time: approximated as workflow_created_at by default.
-    # Overridden when a workflow parameter carries a more precise MinIO event time.
+    # ingest_reference_time: dispatcher_created_at when available, else omnipass created_at.
     ingest_reference_time: Optional[datetime] = None
 
-    # Derived KPIs (seconds)
-    workflow_queue_sec: Optional[float] = None   # workflow_started_at - workflow_created_at
-    workflow_run_sec: Optional[float] = None     # workflow_finished_at - workflow_started_at
-    stac_publish_sec: Optional[float] = None     # stac_seen_at - workflow_finished_at
+    # Derived KPIs (seconds) — computed by kpi.py
+    # Omnipass-level (the meaningful performance signal):
+    workflow_queue_sec: Optional[float] = None   # omnipass started_at - created_at
+    workflow_run_sec: Optional[float] = None     # omnipass finished_at - started_at
+    # Dispatcher-level (should be fast; high value = orchestration lag):
+    dispatcher_queue_sec: Optional[float] = None
+    dispatcher_run_sec: Optional[float] = None
+    # Pipeline gap (time between dispatcher finish and omnipass start):
+    pipeline_gap_sec: Optional[float] = None     # omnipass created_at - dispatcher finished_at
+    # End-to-end:
+    stac_publish_sec: Optional[float] = None     # stac_seen_at - omnipass finished_at
     end_to_end_sec: Optional[float] = None       # stac_seen_at - ingest_reference_time
 
-    # Final disposition
+    # Final disposition (reflects omnipass phase)
     final_status: str = "in_progress"  # succeeded | failed | timeout | in_progress
 
 
@@ -151,7 +178,12 @@ class ProductRecord:
 
 @dataclass
 class StacRecord:
-    """Tracks when a STAC item was first observed for a given product."""
+    """
+    Tracks when a STAC item was first observed for a given product.
+
+    Source: either from the MinIO kafka-message.json artifact (preferred)
+    or from direct STAC API polling (fallback).
+    """
 
     run_id: str
     product_id: str
@@ -160,7 +192,11 @@ class StacRecord:
 
     first_seen_at: Optional[datetime] = None
     verification_status: str = "not_found"  # not_found | found | verified
+    # Discovery method: "artifact" (from kafka-message.json) | "poll" (from STAC API)
+    discovery_method: str = "poll"
 
+    # Full STAC URL (from artifact: {stac_public_endpoint}/collections/{coll}/items/{id})
+    stac_url: Optional[str] = None
     # Snapshot of relevant STAC item fields at first observation
     stac_datetime: Optional[str] = None
     stac_bbox: Optional[list] = None

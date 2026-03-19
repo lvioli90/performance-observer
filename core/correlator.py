@@ -1,41 +1,64 @@
 """
 core/correlator.py
 ==================
-Isolates all correlation logic between:
-  MinIO object key  ->  Argo workflow  ->  pod / step  ->  STAC item
+Correlation logic for the IRIDE ingestion pipeline.
 
-Correlation strategy (in priority order)
------------------------------------------
-1. LABEL-BASED (primary, most reliable)
-   The Argo workflow carries a label or parameter whose value is the MinIO
-   object key.  The label name is configured via
-   ``correlation.object_key_label``.  From the object key the product_id is
-   extracted with ``correlation.product_id_from_object_key`` regex.
+Pipeline architecture
+---------------------
+  MinIO drop-bucket/{s3-key}
+      │
+      └─► ingestion-dispatcher workflow
+              param: s3-key   = "path/to/product.zip"
+              param: s3-bucket = "drop-bucket"
+              │
+              │  on success → Kafka iride.{partitionkey}.dispatched
+              │  (triggers omnipass externally)
+              │
+              └─► ingestor-omnipass workflow
+                      param: reference = "s3://drop-bucket/path/to/product.zip"
+                      │
+                      │  steps: resolve-config → prepare → argo-cwl (calrissian)
+                      │
+                      │  on exit → writes {workflow.uid}/kafka-message.json to MinIO
+                      │            contains: stac_url, stac_item.id, stac_item.collection
+                      │
+                      └─► STAC catalog
 
-2. WORKFLOW-NAME-BASED (secondary)
-   If ``correlation.workflow_name_contains_product`` is true, the product_id
-   is extracted from the workflow name using
-   ``correlation.product_id_from_workflow_name_regex``.
-
-3. TIME-WINDOW FALLBACK (last resort)
-   If neither label nor name correlation is possible, the correlator can
-   match a workflow to a product by looking at creation timestamps within
-   a configurable window (``correlation.time_window_fallback_sec``).
-   NOTE: this fallback is unreliable when multiple products are injected
-   simultaneously; it is provided only to allow partial data collection.
-
-STAC correlation
+Shared identifier
 -----------------
-The STAC item id is derived from product_id using the template
-``correlation.stac_item_id_from_product_id``.  If direct lookup fails,
-the correlator searches the STAC collection by datetime range.
+The s3 object key is the only identifier shared by both workflows:
+  dispatcher:  s3-key parameter          (relative: "path/to/product.zip")
+  omnipass:    reference parameter        (absolute: "s3://drop-bucket/path/to/product.zip")
+  product_id:  filename without extension ("product")
 
-All assumptions are documented in the config schema (example.config.yaml).
+Correlation priority
+--------------------
+1. PARAMETER-BASED (primary):
+   - For dispatcher: read 's3-key' parameter → extract product_id by regex
+   - For omnipass:   read 'reference' parameter → strip s3://bucket/ → same regex
+   Both link to the same ProductRecord via product_id.
+
+2. ARTIFACT-BASED STAC discovery (when MinIO is accessible):
+   After omnipass completes, read {workflow.uid}/kafka-message.json from MinIO.
+   This gives the exact STAC item id and collection without guessing.
+   Handled by collectors/minio_artifact.py + update_stac_from_artifact().
+
+3. TIME-WINDOW FALLBACK (last resort):
+   Match workflows by creation timestamp proximity. Unreliable at high concurrency
+   — logged but not used for automatic ProductRecord creation.
+
+IMPORTANT: podGC in omnipass
+-----------------------------
+ingestor-omnipass has podGC: OnPodSuccess with deleteDelayDuration=30s.
+Succeeded pods are deleted from Kubernetes after 30s.
+The pod status poller (k8s.py) must therefore run aggressively (≤15s interval)
+to catch pod timing before GC removes them from the API.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
@@ -44,92 +67,389 @@ from core.run_context import RunContext
 
 logger = logging.getLogger(__name__)
 
+# Workflow type identifiers (matched against template_name or workflow_name)
+_DISPATCHER = "dispatcher"
+_OMNIPASS = "omnipass"
+
 
 class Correlator:
     """
-    Maintains and updates the product->workflow->pod->STAC correlation map.
+    Maintains the product ↔ workflow ↔ pod ↔ STAC correlation map.
 
-    Call ``correlate_workflow(record)`` every time a new or updated
-    WorkflowRecord is available.  The correlator will attempt to link it to an
-    existing ProductRecord or create a new one.
+    Call ``correlate_workflow(record)`` on every WorkflowRecord update.
+    The correlator detects the workflow type (dispatcher vs omnipass),
+    extracts the product_id, and upserts the shared ProductRecord.
     """
 
     def __init__(self, ctx: RunContext):
         self.ctx = ctx
+        self._product_id_re: Optional[re.Pattern] = None
+        if ctx.corr_product_id_s3_key_regex:
+            self._product_id_re = re.compile(ctx.corr_product_id_s3_key_regex)
 
     # ------------------------------------------------------------------
     # Main entry point
     # ------------------------------------------------------------------
 
-    def correlate_workflow(self, wf: WorkflowRecord) -> Optional[str]:
+    def correlate_workflow(
+        self,
+        wf: WorkflowRecord,
+        minio_collector=None,
+    ) -> Optional[str]:
         """
-        Try to determine the product_id for a workflow.
+        Determine product_id for a workflow and upsert the ProductRecord.
 
-        Returns the product_id if found, None otherwise.
-        Updates the in-memory ProductRecord (creating it if needed).
+        Parameters
+        ----------
+        wf : WorkflowRecord
+        minio_collector : MinioArtifactCollector or None
+            If provided and this is a dispatcher workflow, resolve T0 from
+            ctx.drop_bucket_events (set by MinioDropWatcher) or fall back
+            to MinIO stat_object via minio_collector.
+
+        Returns product_id if found, None otherwise.
         """
-        product_id = self._try_label_correlation(wf)
+        wf_type = self._detect_workflow_type(wf)
+        if wf_type is None:
+            logger.debug(
+                "Unknown workflow type for %s (template=%s); skipping",
+                wf.workflow_name, wf.template_name,
+            )
+            return None
 
-        if product_id is None and self.ctx.corr_wf_name_contains_product:
-            product_id = self._try_name_correlation(wf)
+        product_id = None
+        if wf_type == _DISPATCHER:
+            product_id = self._correlate_dispatcher(wf)
+        elif wf_type == _OMNIPASS:
+            product_id = self._correlate_omnipass(wf)
 
         if product_id is None:
-            # Time-window fallback is logged but not used for ProductRecord
-            # creation because it cannot be made reliable without knowing
-            # the injection timestamps.  It is available for manual analysis.
-            logger.debug(
-                "No direct correlation for workflow %s; time-window fallback available",
-                wf.workflow_name,
+            logger.debug("No correlation for %s wf=%s", wf_type, wf.workflow_name)
+            return None
+
+        wf.product_id = product_id
+        self._upsert_product(product_id, wf, wf_type)
+
+        # Resolve true T0 from MinIO stat_object immediately after dispatcher correlation.
+        # T0 = LastModified of the object in the drop-bucket = most accurate ingest time.
+        if wf_type == _DISPATCHER and minio_collector is not None:
+            self._resolve_t0(product_id, wf, minio_collector)
+
+        return product_id
+
+    def _resolve_t0(self, product_id: str, wf: WorkflowRecord, minio_collector) -> None:
+        """
+        Set ingest_reference_time (true T0) on the ProductRecord.
+
+        Priority:
+          1. ctx.drop_bucket_events[s3_key]  — set by MinioDropWatcher in real-time
+             (most accurate: records the exact moment the object appeared)
+          2. minio_collector.fetch_ingest_time()  — retroactive stat_object call
+             (accurate but requires a live MinIO connection at correlation time)
+          3. Falls back to dispatcher.created_at already set in _update_from_dispatcher
+        """
+        s3_key = wf.parameters.get(self.ctx.corr_dispatcher_s3_key_param, "")
+        if not s3_key:
+            return
+
+        # Priority 1: real-time observation from drop-bucket watcher
+        with self.ctx._lock:
+            t0 = self.ctx.drop_bucket_events.get(s3_key)
+
+        if t0 is not None:
+            source = "drop-watcher"
+        else:
+            # Priority 2: retroactive stat_object via MinioArtifactCollector
+            s3_bucket = wf.parameters.get(
+                self.ctx.corr_dispatcher_s3_bucket_param, "drop-bucket"
             )
+            t0 = minio_collector.fetch_ingest_time(product_id, s3_key, s3_bucket)
+            source = "stat_object"
 
+        if t0 is None:
+            return   # falls back to dispatcher.created_at set in _update_from_dispatcher
+
+        with self.ctx._lock:
+            product = self.ctx.products.get(product_id)
+            if product is not None:
+                product.ingest_reference_time = t0
+                self.ctx._products_dirty.append(product_id)
+                dispatcher_created = product.dispatcher_created_at
+                delta = (
+                    (dispatcher_created - t0).total_seconds()
+                    if dispatcher_created else float("nan")
+                )
+                logger.info(
+                    "T0 set from %s: product_id=%s T0=%s "
+                    "(dispatcher.created_at=%s delta=%.1fs)",
+                    source,
+                    product_id,
+                    t0.isoformat(),
+                    dispatcher_created.isoformat() if dispatcher_created else "N/A",
+                    delta,
+                )
+
+    # ------------------------------------------------------------------
+    # Workflow type detection
+    # ------------------------------------------------------------------
+
+    def _detect_workflow_type(self, wf: WorkflowRecord) -> Optional[str]:
+        """
+        Identify whether a workflow is a dispatcher or omnipass ingestor.
+        Checks template_name first, then workflow_name as fallback.
+        """
+        search_in = [
+            (wf.template_name or "").lower(),
+            wf.workflow_name.lower(),
+        ]
+        dispatcher_kw = self.ctx.corr_dispatcher_template.lower()
+        omnipass_kw = self.ctx.corr_omnipass_template.lower()
+
+        for text in search_in:
+            if dispatcher_kw and dispatcher_kw in text:
+                return _DISPATCHER
+            if omnipass_kw and omnipass_kw in text:
+                return _OMNIPASS
+        return None
+
+    # ------------------------------------------------------------------
+    # Dispatcher correlation
+    # ------------------------------------------------------------------
+
+    def _correlate_dispatcher(self, wf: WorkflowRecord) -> Optional[str]:
+        """
+        Extract product_id from the dispatcher's 's3-key' parameter.
+        Also builds the full s3_url and stores it as object_key.
+
+          s3-key   = "path/to/S2A_MSIL2A_20230101.zip"
+          s3-bucket = "drop-bucket"
+          object_key = "s3://drop-bucket/path/to/S2A_MSIL2A_20230101.zip"
+          product_id = "S2A_MSIL2A_20230101"
+        """
+        s3_key_param = self.ctx.corr_dispatcher_s3_key_param
+        s3_bucket_param = self.ctx.corr_dispatcher_s3_bucket_param
+
+        s3_key = wf.parameters.get(s3_key_param, "")
+        s3_bucket = wf.parameters.get(s3_bucket_param, "drop-bucket")
+
+        if not s3_key:
+            logger.debug(
+                "Dispatcher %s has no '%s' parameter", wf.workflow_name, s3_key_param
+            )
+            return None
+
+        s3_url = f"s3://{s3_bucket}/{s3_key}"
+        wf.object_key = s3_url
+
+        product_id = self._extract_product_id_from_s3_key(s3_key)
         if product_id:
-            self._upsert_product(product_id, wf)
-            # Update the workflow record with the resolved product_id
-            wf.product_id = product_id
-
+            logger.debug(
+                "Dispatcher correlation: wf=%s s3_key=%s product_id=%s",
+                wf.workflow_name, s3_key, product_id,
+            )
         return product_id
 
     # ------------------------------------------------------------------
-    # Correlation strategies
+    # Omnipass correlation
     # ------------------------------------------------------------------
 
-    def _try_label_correlation(self, wf: WorkflowRecord) -> Optional[str]:
+    def _correlate_omnipass(self, wf: WorkflowRecord) -> Optional[str]:
         """
-        Strategy 1: extract object_key from a workflow label/parameter,
-        then derive product_id from the object_key via regex.
+        Extract product_id from the omnipass 'reference' parameter.
+
+          reference = "s3://drop-bucket/path/to/S2A_MSIL2A_20230101.zip"
+          object_key = reference (stored as-is)
+          s3_key extracted = "path/to/S2A_MSIL2A_20230101.zip"
+          product_id = "S2A_MSIL2A_20230101"
         """
-        label_name = self.ctx.corr_object_key_label
-        if not label_name:
-            return None
+        reference_param = self.ctx.corr_omnipass_reference_param
+        reference = wf.parameters.get(reference_param, "")
 
-        # Check labels first, then parameters
-        object_key = wf.labels.get(label_name) or wf.parameters.get(label_name)
-        if not object_key:
-            return None
-
-        product_id = self.ctx.extract_product_id_from_object_key(object_key)
-        if product_id:
-            wf.object_key = object_key
+        if not reference:
             logger.debug(
-                "Label correlation: workflow=%s object_key=%s product_id=%s",
-                wf.workflow_name,
-                object_key,
-                product_id,
+                "Omnipass %s has no '%s' parameter", wf.workflow_name, reference_param
+            )
+            return None
+
+        wf.object_key = reference
+
+        # Strip the "s3://bucket/" prefix to get the relative key
+        s3_key = re.sub(r"^s3://[^/]+/", "", reference)
+
+        product_id = self._extract_product_id_from_s3_key(s3_key)
+        if product_id:
+            logger.debug(
+                "Omnipass correlation: wf=%s reference=%s product_id=%s",
+                wf.workflow_name, reference, product_id,
             )
         return product_id
 
-    def _try_name_correlation(self, wf: WorkflowRecord) -> Optional[str]:
+    # ------------------------------------------------------------------
+    # Regex helpers
+    # ------------------------------------------------------------------
+
+    def _extract_product_id_from_s3_key(self, s3_key: str) -> Optional[str]:
+        """Apply the configured regex to extract product_id from an s3 key."""
+        if not self._product_id_re or not s3_key:
+            return None
+        m = self._product_id_re.search(s3_key)
+        if m:
+            try:
+                return m.group("product_id")
+            except IndexError:
+                return None
+        return None
+
+    # ------------------------------------------------------------------
+    # ProductRecord upsert
+    # ------------------------------------------------------------------
+
+    def _upsert_product(
+        self, product_id: str, wf: WorkflowRecord, wf_type: str
+    ) -> ProductRecord:
         """
-        Strategy 2: extract product_id from the workflow name via regex.
+        Create or update the ProductRecord for a given product_id.
+
+        Both dispatcher and omnipass workflows contribute to the same record:
+        - dispatcher provides: workflow_created_at, workflow_started_at (fast steps)
+        - omnipass provides:   the actual processing times (heavy steps)
+        The ProductRecord uses omnipass timing for the core workflow KPIs
+        because that is where the real work happens. Both are stored for
+        full end-to-end analysis.
         """
-        product_id = self.ctx.extract_product_id_from_workflow_name(wf.workflow_name)
-        if product_id:
-            logger.debug(
-                "Name correlation: workflow=%s product_id=%s",
-                wf.workflow_name,
-                product_id,
-            )
-        return product_id
+        with self.ctx._lock:
+            existing = self.ctx.products.get(product_id)
+
+            if existing is None:
+                record = ProductRecord(
+                    run_id=self.ctx.run_id,
+                    product_id=product_id,
+                    object_key=wf.object_key,
+                )
+                self.ctx.products[product_id] = record
+                self.ctx._products_dirty.append(product_id)
+                logger.debug(
+                    "Created ProductRecord: product_id=%s from %s wf=%s",
+                    product_id, wf_type, wf.workflow_name,
+                )
+            else:
+                record = existing
+                # Prefer the earliest object_key (dispatcher's may be cleaner)
+                if wf.object_key and not record.object_key:
+                    record.object_key = wf.object_key
+
+            # Update fields based on workflow type
+            if wf_type == _DISPATCHER:
+                self._update_from_dispatcher(record, wf)
+            elif wf_type == _OMNIPASS:
+                self._update_from_omnipass(record, wf)
+
+            self.ctx._products_dirty.append(product_id)
+            return record
+
+    def _update_from_dispatcher(
+        self, record: ProductRecord, wf: WorkflowRecord
+    ) -> None:
+        """
+        Populate ProductRecord fields from the dispatcher workflow.
+
+        The dispatcher is the entry point — its created_at is the earliest
+        observable timestamp and serves as ingest_reference_time.
+        """
+        record.dispatcher_workflow_name = wf.workflow_name
+
+        # ingest_reference_time: use dispatcher created_at as the best available
+        # approximation of when the product entered the system.
+        if record.ingest_reference_time is None and wf.created_at:
+            record.ingest_reference_time = wf.created_at
+
+        # Dispatcher-level timing (fast: typically seconds)
+        if record.dispatcher_created_at is None:
+            record.dispatcher_created_at = wf.created_at
+        record.dispatcher_started_at = wf.started_at
+        record.dispatcher_finished_at = wf.finished_at
+        record.dispatcher_status = wf.phase
+
+    def _update_from_omnipass(
+        self, record: ProductRecord, wf: WorkflowRecord
+    ) -> None:
+        """
+        Populate ProductRecord fields from the omnipass ingestor workflow.
+
+        The omnipass is where the actual ingestion happens — its timing
+        determines the core workflow_queue_sec, workflow_run_sec KPIs.
+        """
+        record.workflow_name = wf.workflow_name
+        record.workflow_created_at = wf.created_at
+        record.workflow_started_at = wf.started_at
+        record.workflow_finished_at = wf.finished_at
+        record.final_status = _phase_to_status(wf.phase)
+
+        # If dispatcher didn't provide ingest_reference_time, fall back to
+        # omnipass created_at (slightly less accurate but still useful).
+        if record.ingest_reference_time is None and wf.created_at:
+            record.ingest_reference_time = wf.created_at
+
+    # ------------------------------------------------------------------
+    # STAC update from MinIO artifact
+    # ------------------------------------------------------------------
+
+    def update_stac_from_artifact(
+        self,
+        product_id: str,
+        stac_item_id: str,
+        collection_id: str,
+        stac_seen_at: datetime,
+        stac_url: Optional[str] = None,
+    ) -> None:
+        """
+        Update the ProductRecord with STAC visibility info sourced from the
+        omnipass kafka-message.json artifact (the most reliable source).
+
+        Called by collectors/minio_artifact.py after reading the artifact.
+        """
+        from core.models import StacRecord
+
+        stac_record = StacRecord(
+            run_id=self.ctx.run_id,
+            product_id=product_id,
+            stac_item_id=stac_item_id,
+            collection_id=collection_id,
+            first_seen_at=stac_seen_at,
+            verification_status="found",
+            stac_url=stac_url,
+        )
+        self.ctx.add_or_update_stac(stac_record)
+
+        with self.ctx._lock:
+            product = self.ctx.products.get(product_id)
+            if product and product.stac_seen_at is None:
+                product.stac_seen_at = stac_seen_at
+                self.ctx._products_dirty.append(product_id)
+                logger.debug(
+                    "STAC visibility from artifact: product_id=%s item_id=%s collection=%s",
+                    product_id, stac_item_id, collection_id,
+                )
+
+    # ------------------------------------------------------------------
+    # STAC update from polling
+    # ------------------------------------------------------------------
+
+    def update_stac_from_poll(
+        self, product_id: str, stac_seen_at: datetime
+    ) -> None:
+        """
+        Mark a product as seen in STAC from direct polling (fallback path).
+        """
+        with self.ctx._lock:
+            product = self.ctx.products.get(product_id)
+            if product and product.stac_seen_at is None:
+                product.stac_seen_at = stac_seen_at
+                self.ctx._products_dirty.append(product_id)
+
+    # ------------------------------------------------------------------
+    # Time-window fallback (informational)
+    # ------------------------------------------------------------------
 
     def time_window_candidates(
         self,
@@ -137,89 +457,49 @@ class Correlator:
         window_sec: Optional[int] = None,
     ) -> List[WorkflowRecord]:
         """
-        Strategy 3 (fallback): return workflows whose created_at falls within
-        ``window_sec`` seconds of ``reference_time``.
-
-        This is returned for informational purposes only; the caller decides
-        what to do with the candidates.
+        Return workflows whose created_at falls within window_sec of reference_time.
+        For informational use only — not used for automatic correlation.
         """
         window = timedelta(seconds=window_sec or self.ctx.corr_time_window_sec)
         candidates = []
         for wf in self.ctx.snapshot_workflows():
             if wf.created_at is None:
                 continue
-            delta = abs((wf.created_at - reference_time).total_seconds())
-            if delta <= window.total_seconds():
+            if abs((wf.created_at - reference_time).total_seconds()) <= window.total_seconds():
                 candidates.append(wf)
         return candidates
 
     # ------------------------------------------------------------------
-    # ProductRecord upsert
+    # Semaphore capacity helper
     # ------------------------------------------------------------------
 
-    def _upsert_product(self, product_id: str, wf: WorkflowRecord) -> ProductRecord:
+    def get_semaphore_capacity(self) -> Optional[int]:
         """
-        Create or update a ProductRecord from a correlated WorkflowRecord.
+        Read the current semaphore limit for ingestor-omnipass from the
+        semaphore-ingestors-uat ConfigMap.
+
+        Returns the integer value, or None if not accessible.
+        This represents the maximum concurrent omnipass workflows allowed.
         """
-        with self.ctx._lock:
-            existing = self.ctx.products.get(product_id)
-            if existing is None:
-                record = ProductRecord(
-                    run_id=self.ctx.run_id,
-                    product_id=product_id,
-                    object_key=wf.object_key,
-                    workflow_name=wf.workflow_name,
-                    workflow_created_at=wf.created_at,
-                    workflow_started_at=wf.started_at,
-                    workflow_finished_at=wf.finished_at,
-                    # Use workflow created_at as the ingest reference approximation
-                    ingest_reference_time=wf.created_at,
-                    final_status=_phase_to_status(wf.phase),
-                )
-                self.ctx.products[product_id] = record
-                self.ctx._products_dirty.append(product_id)
-                logger.debug("Created ProductRecord for product_id=%s", product_id)
-            else:
-                # Update fields that may have changed
-                if wf.object_key and not existing.object_key:
-                    existing.object_key = wf.object_key
-                existing.workflow_name = wf.workflow_name
-                existing.workflow_created_at = wf.created_at
-                existing.workflow_started_at = wf.started_at
-                existing.workflow_finished_at = wf.finished_at
-                if existing.ingest_reference_time is None:
-                    existing.ingest_reference_time = wf.created_at
-                existing.final_status = _phase_to_status(wf.phase)
-                self.ctx._products_dirty.append(product_id)
-                return existing
+        try:
+            from kubernetes import client as k8s_client, config as k8s_config
+            try:
+                k8s_config.load_incluster_config()
+            except Exception:
+                k8s_config.load_kube_config(context=self.ctx.k8s_context)
 
-        return self.ctx.products[product_id]
+            v1 = k8s_client.CoreV1Api()
+            cm_name = getattr(self.ctx, "semaphore_configmap_name", "semaphore-ingestors-uat")
+            cm_key = getattr(self.ctx, "semaphore_configmap_key", "workflow")
+            ns = self.ctx.argo_namespace
 
-    # ------------------------------------------------------------------
-    # STAC correlation
-    # ------------------------------------------------------------------
-
-    def derive_stac_item_id(self, product_id: str) -> str:
-        """Return the expected STAC item id for a given product_id."""
-        return self.ctx.derive_stac_item_id(product_id)
-
-    def update_stac_visibility(
-        self, product_id: str, stac_seen_at: datetime
-    ) -> None:
-        """
-        Mark a product as seen in STAC and update the ProductRecord.
-        """
-        with self.ctx._lock:
-            product = self.ctx.products.get(product_id)
-            if product is not None:
-                if product.stac_seen_at is None:
-                    product.stac_seen_at = stac_seen_at
-                    self.ctx._products_dirty.append(product_id)
-                    logger.debug(
-                        "STAC visibility updated: product_id=%s seen_at=%s",
-                        product_id,
-                        stac_seen_at.isoformat(),
-                    )
+            cm = v1.read_namespaced_config_map(name=cm_name, namespace=ns)
+            val = (cm.data or {}).get(cm_key)
+            if val is not None:
+                return int(val)
+        except Exception as exc:
+            logger.debug("Could not read semaphore ConfigMap: %s", exc)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +507,6 @@ class Correlator:
 # ---------------------------------------------------------------------------
 
 def _phase_to_status(phase: str) -> str:
-    """Map an Argo workflow phase to a product final_status string."""
     mapping = {
         "Succeeded": "succeeded",
         "Failed": "failed",

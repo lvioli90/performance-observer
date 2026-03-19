@@ -71,11 +71,45 @@ def _safe_mean(values: List[float]) -> Optional[float]:
 # ---------------------------------------------------------------------------
 
 def compute_product_derived(p: dict) -> dict:
-    """Compute derived seconds fields for a product record dict (in-place)."""
-    p["workflow_queue_sec"] = _delta_sec(p.get("workflow_created_at"), p.get("workflow_started_at"))
-    p["workflow_run_sec"] = _delta_sec(p.get("workflow_started_at"), p.get("workflow_finished_at"))
-    p["stac_publish_sec"] = _delta_sec(p.get("workflow_finished_at"), p.get("stac_seen_at"))
-    p["end_to_end_sec"] = _delta_sec(p.get("ingest_reference_time"), p.get("stac_seen_at"))
+    """
+    Compute derived seconds fields for a product record dict (in-place).
+
+    Two-workflow pipeline:
+      dispatcher_queue_sec  = dispatcher started_at - created_at
+      dispatcher_run_sec    = dispatcher finished_at - started_at
+      workflow_queue_sec    = omnipass started_at - created_at   (the meaningful queue)
+      workflow_run_sec      = omnipass finished_at - started_at  (the meaningful run)
+      pipeline_gap_sec      = omnipass created_at - dispatcher finished_at
+                              (Kafka trigger latency: time from dispatcher done to omnipass created)
+      stac_publish_sec      = stac_seen_at - omnipass finished_at
+      end_to_end_sec        = stac_seen_at - ingest_reference_time (= dispatcher created_at)
+    """
+    # Dispatcher timing
+    p["dispatcher_queue_sec"] = _delta_sec(
+        p.get("dispatcher_created_at"), p.get("dispatcher_started_at")
+    )
+    p["dispatcher_run_sec"] = _delta_sec(
+        p.get("dispatcher_started_at"), p.get("dispatcher_finished_at")
+    )
+    # Pipeline gap (Kafka trigger latency): dispatcher_finished → omnipass_created
+    p["pipeline_gap_sec"] = _delta_sec(
+        p.get("dispatcher_finished_at"), p.get("workflow_created_at")
+    )
+    # Omnipass (heavy ingestor) timing
+    p["workflow_queue_sec"] = _delta_sec(
+        p.get("workflow_created_at"), p.get("workflow_started_at")
+    )
+    p["workflow_run_sec"] = _delta_sec(
+        p.get("workflow_started_at"), p.get("workflow_finished_at")
+    )
+    # STAC publication latency (after omnipass finishes)
+    p["stac_publish_sec"] = _delta_sec(
+        p.get("workflow_finished_at"), p.get("stac_seen_at")
+    )
+    # Full end-to-end from earliest observable event
+    p["end_to_end_sec"] = _delta_sec(
+        p.get("ingest_reference_time"), p.get("stac_seen_at")
+    )
     return p
 
 
@@ -197,16 +231,35 @@ class KPIEngine:
     # ------------------------------------------------------------------
 
     def workflow_kpis(self) -> dict:
+        """
+        Compute workflow-level KPIs split by workflow type:
+          - dispatcher: fast dispatch step (should be seconds)
+          - omnipass:   heavy ingestor (minutes; the main performance signal)
+          - pipeline_gap: Kafka trigger latency between dispatcher done and omnipass created
+        """
         finished_wf = [
             w for w in self.workflows
             if w.get("phase") in ("Succeeded", "Failed", "Error")
         ]
 
-        queue_values = [
-            w["queue_sec"] for w in finished_wf if w.get("queue_sec") is not None
+        # Split by workflow type (using template_name)
+        dispatcher_wf = [
+            w for w in finished_wf
+            if "dispatcher" in (w.get("template_name") or w.get("workflow_name", "")).lower()
         ]
-        duration_values = [
-            w["run_sec"] for w in finished_wf if w.get("run_sec") is not None
+        omnipass_wf = [
+            w for w in finished_wf
+            if "omnipass" in (w.get("template_name") or w.get("workflow_name", "")).lower()
+        ]
+
+        def _queue(wfs): return [w["queue_sec"] for w in wfs if w.get("queue_sec") is not None]
+        def _run(wfs):   return [w["run_sec"] for w in wfs if w.get("run_sec") is not None]
+
+        # Pipeline gap (Kafka trigger latency): from ProductRecord derived field
+        gap_values = [
+            p.get("pipeline_gap_sec")
+            for p in self.products
+            if p.get("pipeline_gap_sec") is not None
         ]
 
         # Max pending / running from timeseries
@@ -216,22 +269,37 @@ class KPIEngine:
         max_running = max(
             (row.get("workflows_running", 0) for row in self.timeseries), default=0
         )
-
-        # Average observed concurrency = mean(running) over timeseries
-        running_vals = [
-            row.get("workflows_running", 0) for row in self.timeseries
-        ]
+        running_vals = [row.get("workflows_running", 0) for row in self.timeseries]
         avg_concurrency = _safe_mean([float(v) for v in running_vals])
 
+        # Combined (all workflows) for backward-compat
+        all_queue = _queue(finished_wf)
+        all_run = _run(finished_wf)
+
         return {
-            "queue_avg": _safe_mean(queue_values),
-            "queue_p50": _percentile(queue_values, 50),
-            "queue_p95": _percentile(queue_values, 95),
-            "queue_p99": _percentile(queue_values, 99),
-            "duration_avg": _safe_mean(duration_values),
-            "duration_p50": _percentile(duration_values, 50),
-            "duration_p95": _percentile(duration_values, 95),
-            "duration_p99": _percentile(duration_values, 99),
+            # Combined (all workflow types)
+            "queue_avg": _safe_mean(all_queue),
+            "queue_p50": _percentile(all_queue, 50),
+            "queue_p95": _percentile(all_queue, 95),
+            "queue_p99": _percentile(all_queue, 99),
+            "duration_avg": _safe_mean(all_run),
+            "duration_p50": _percentile(all_run, 50),
+            "duration_p95": _percentile(all_run, 95),
+            "duration_p99": _percentile(all_run, 99),
+            # Dispatcher-specific (fast steps)
+            "dispatcher_queue_avg": _safe_mean(_queue(dispatcher_wf)),
+            "dispatcher_queue_p95": _percentile(_queue(dispatcher_wf), 95),
+            "dispatcher_duration_avg": _safe_mean(_run(dispatcher_wf)),
+            "dispatcher_duration_p95": _percentile(_run(dispatcher_wf), 95),
+            # Omnipass-specific (heavy ingestor)
+            "omnipass_queue_avg": _safe_mean(_queue(omnipass_wf)),
+            "omnipass_queue_p95": _percentile(_queue(omnipass_wf), 95),
+            "omnipass_duration_avg": _safe_mean(_run(omnipass_wf)),
+            "omnipass_duration_p95": _percentile(_run(omnipass_wf), 95),
+            # Kafka trigger latency (dispatcher_finished → omnipass_created)
+            "pipeline_gap_avg": _safe_mean(gap_values),
+            "pipeline_gap_p95": _percentile(gap_values, 95),
+            # Concurrency
             "max_pending_workflows": max_pending,
             "max_running_workflows": max_running,
             "avg_concurrency": avg_concurrency,
