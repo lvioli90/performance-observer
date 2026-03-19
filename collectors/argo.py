@@ -220,6 +220,7 @@ class ArgoCollector:
         status = raw.get("status", {})
 
         name = meta.get("name")
+        uid = meta.get("uid")   # K8s UUID — used as MinIO artifact path prefix
         ns = meta.get("namespace", self.ctx.argo_namespace)
         if not name:
             return None
@@ -252,6 +253,7 @@ class ArgoCollector:
             run_id=self.ctx.run_id,
             workflow_name=name,
             namespace=ns,
+            uid=uid,
             phase=phase,
             template_name=template_name,
             labels=labels,

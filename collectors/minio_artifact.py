@@ -114,7 +114,8 @@ class MinioArtifactCollector:
         if not self._ensure_client():
             return 0
 
-        # Find completed omnipass workflows not yet processed
+        # Find completed omnipass workflows not yet processed.
+        # Use workflow_name as the dedup key (uid may be None if not yet parsed).
         omnipass_kw = self.ctx.corr_omnipass_template.lower()
         completed_omnipass = [
             wf for wf in self.ctx.snapshot_workflows()
@@ -122,6 +123,7 @@ class MinioArtifactCollector:
             and wf.phase in ("Succeeded", "Failed")
             and wf.workflow_name not in self._checked_uids
             and wf.product_id is not None
+            and wf.uid is not None   # uid required for artifact path
         ]
 
         if not completed_omnipass:
@@ -150,21 +152,19 @@ class MinioArtifactCollector:
         """
         Read the kafka-message.json artifact for a given workflow.
 
-        The artifact key is: {workflow_name}/kafka-message.json
-        (Argo uses the workflow name as the uid-based prefix in artifact keys,
-        matching the template: s3:key: "{{workflow.uid}}/kafka-message.json").
-
-        NOTE: Argo substitutes workflow.uid at runtime. If your cluster stores
-        artifacts under workflow.uid (not workflow.name), look up the uid from
-        the WorkflowRecord metadata. Currently we use workflow_name as the key
-        since uid is not directly stored on WorkflowRecord. Adjust if needed.
-
-        PLUG-IN: If artifacts use workflow.uid instead of workflow.name,
-        add uid to WorkflowRecord and use it here.
+        Artifact key = {workflow.uid}/kafka-message.json
+        The uid is the Kubernetes UUID from metadata.uid (NOT the workflow name).
+        This matches the template:  s3: key: "{{workflow.uid}}/kafka-message.json"
         """
         bucket = self.ctx.minio_artifact_bucket
-        # Try workflow.name-based key first, then as fallback check if wf has a uid
-        artifact_key = f"{workflow_name}/kafka-message.json"
+        # uid is stored on WorkflowRecord; caller passes workflow_name but we
+        # look up the uid from the in-memory store.
+        wf = self.ctx.workflows.get(workflow_name)
+        uid = wf.uid if wf else None
+        if not uid:
+            logger.debug("No uid for workflow %s; cannot read artifact", workflow_name)
+            return None
+        artifact_key = f"{uid}/kafka-message.json"
 
         try:
             response = self._minio_client.get_object(bucket, artifact_key)

@@ -31,6 +31,11 @@ class WorkflowRecord:
     workflow_name: str
     namespace: str
 
+    # Kubernetes UID (UUID format, e.g. "9acd3eb9-9b3d-4b00-a64f-1ac37b556f4a").
+    # IMPORTANT: Argo artifact paths use {{workflow.uid}}, NOT workflow.name.
+    # MinIO artifact key = "{uid}/kafka-message.json"
+    uid: Optional[str] = None
+
     # Phase reported by Argo: Pending | Running | Succeeded | Failed | Error
     phase: str = "Unknown"
 
