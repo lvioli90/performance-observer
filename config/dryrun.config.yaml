@@ -83,7 +83,7 @@ timing:
 # Correlation
 # --------------------------------------------------------
 correlation:
-  dispatcher_template: "ingestion-dispatcher"
+  dispatcher_template: "dispatcher"
   dispatcher_s3_key_param: "s3-key"
   dispatcher_s3_bucket_param: "s3-bucket"
   omnipass_template: "omnipass"
