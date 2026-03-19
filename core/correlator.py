@@ -103,8 +103,9 @@ class Correlator:
         ----------
         wf : WorkflowRecord
         minio_collector : MinioArtifactCollector or None
-            If provided and this is a dispatcher workflow, fetch T0 from
-            MinIO stat_object immediately after correlation.
+            If provided and this is a dispatcher workflow, resolve T0 from
+            ctx.drop_bucket_events (set by MinioDropWatcher) or fall back
+            to MinIO stat_object via minio_collector.
 
         Returns product_id if found, None otherwise.
         """
@@ -138,17 +139,33 @@ class Correlator:
 
     def _resolve_t0(self, product_id: str, wf: WorkflowRecord, minio_collector) -> None:
         """
-        Fetch true T0 (MinIO object LastModified) and set ingest_reference_time
-        on the ProductRecord.  Called once per product after dispatcher correlation.
+        Set ingest_reference_time (true T0) on the ProductRecord.
+
+        Priority:
+          1. ctx.drop_bucket_events[s3_key]  — set by MinioDropWatcher in real-time
+             (most accurate: records the exact moment the object appeared)
+          2. minio_collector.fetch_ingest_time()  — retroactive stat_object call
+             (accurate but requires a live MinIO connection at correlation time)
+          3. Falls back to dispatcher.created_at already set in _update_from_dispatcher
         """
         s3_key = wf.parameters.get(self.ctx.corr_dispatcher_s3_key_param, "")
-        s3_bucket = wf.parameters.get(
-            self.ctx.corr_dispatcher_s3_bucket_param, "drop-bucket"
-        )
         if not s3_key:
             return
 
-        t0 = minio_collector.fetch_ingest_time(product_id, s3_key, s3_bucket)
+        # Priority 1: real-time observation from drop-bucket watcher
+        with self.ctx._lock:
+            t0 = self.ctx.drop_bucket_events.get(s3_key)
+
+        if t0 is not None:
+            source = "drop-watcher"
+        else:
+            # Priority 2: retroactive stat_object via MinioArtifactCollector
+            s3_bucket = wf.parameters.get(
+                self.ctx.corr_dispatcher_s3_bucket_param, "drop-bucket"
+            )
+            t0 = minio_collector.fetch_ingest_time(product_id, s3_key, s3_bucket)
+            source = "stat_object"
+
         if t0 is None:
             return   # falls back to dispatcher.created_at set in _update_from_dispatcher
 
@@ -157,15 +174,19 @@ class Correlator:
             if product is not None:
                 product.ingest_reference_time = t0
                 self.ctx._products_dirty.append(product_id)
+                dispatcher_created = product.dispatcher_created_at
+                delta = (
+                    (dispatcher_created - t0).total_seconds()
+                    if dispatcher_created else float("nan")
+                )
                 logger.info(
-                    "T0 set from MinIO stat: product_id=%s T0=%s "
-                    "(dispatcher.created_at was %s, delta=%.1fs)",
+                    "T0 set from %s: product_id=%s T0=%s "
+                    "(dispatcher.created_at=%s delta=%.1fs)",
+                    source,
                     product_id,
                     t0.isoformat(),
-                    product.dispatcher_created_at.isoformat()
-                    if product.dispatcher_created_at else "N/A",
-                    (product.dispatcher_created_at - t0).total_seconds()
-                    if product.dispatcher_created_at else float("nan"),
+                    dispatcher_created.isoformat() if dispatcher_created else "N/A",
+                    delta,
                 )
 
     # ------------------------------------------------------------------

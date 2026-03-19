@@ -144,6 +144,12 @@ class RunContext:
         self.minio_secret_key: str = m.get("secret_key", "")
         self.minio_artifact_bucket: str = m.get("artifact_bucket", "argo-artifacts")
         self.minio_secure: bool = bool(m.get("secure", False))
+        # Drop-bucket watcher config
+        self.minio_drop_bucket: str = m.get("drop_bucket", "drop-bucket")
+        self.minio_drop_prefix: str = m.get("drop_prefix", "")
+        self.minio_drop_poll_sec: int = int(m.get("drop_poll_sec", 15))
+        self.minio_drop_lookback_sec: int = int(m.get("drop_lookback_sec", 120))
+        self.minio_drop_orphan_sec: int = int(m.get("drop_orphan_sec", 180))
 
         # --- Correlation config ---
         c = cfg.get("correlation", {})
@@ -184,6 +190,8 @@ class RunContext:
         # -------------------------------------------------------------------
         # In-memory observation stores (ALL protected by self._lock)
         # -------------------------------------------------------------------
+        # s3_key -> T0 datetime (UTC): written by MinioDropWatcher, read by Correlator
+        self.drop_bucket_events: Dict[str, datetime] = {}
         # workflow_name -> WorkflowRecord
         self.workflows: Dict[str, WorkflowRecord] = {}
         # pod_name -> PodRecord

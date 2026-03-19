@@ -73,10 +73,14 @@ minio:
   secret_key: ""                                # PLUG-IN: secret key
   # Bucket where Argo stores workflow artifacts (matches Argo artifact repository config).
   artifact_bucket: "argo-artifacts"            # PLUG-IN: real artifact bucket
-  # Drop bucket: where ingested products are deposited (stat_object → true T0).
+  # Drop bucket: where ingested products are deposited (watched for true T0).
   # Must match the dispatcher's s3-bucket parameter (default "drop-bucket").
   # If empty, T0 falls back to dispatcher workflow_created_at.
   drop_bucket: "drop-bucket"
+  drop_prefix: ""           # Optional key prefix to filter (e.g. "incoming/"). Empty = all.
+  drop_poll_sec: 15         # How often to list new objects in the drop-bucket.
+  drop_lookback_sec: 120    # On startup, scan this many seconds back to catch in-flight objects.
+  drop_orphan_sec: 180      # Flag as orphan if no dispatcher workflow seen within N seconds.
   secure: false
 
 # --------------------------------------------------------

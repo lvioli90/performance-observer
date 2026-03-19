@@ -50,6 +50,7 @@ from collectors.argo import ArgoCollector
 from collectors.k8s import K8sCollector
 from collectors.stac import StacCollector
 from collectors.minio_artifact import MinioArtifactCollector
+from collectors.minio_drop_watcher import MinioDropWatcher
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -241,6 +242,45 @@ def _artifact_loop(
         ctx.stop_event.wait(timeout=ctx.poll_artifact_sec)
 
 
+def _drop_watcher_loop(
+    ctx: RunContext,
+    drop_watcher: MinioDropWatcher,
+) -> None:
+    """
+    Polls the MinIO drop-bucket for new objects and records T0 in real-time.
+    Periodically runs orphan detection to flag objects never picked up by Argo.
+    """
+    logger = logging.getLogger("observer.drop_watcher_loop")
+    orphan_check_interval = max(ctx.minio_drop_orphan_sec // 4, 30)
+    last_orphan_check = 0.0
+
+    while not ctx.stop_event.is_set():
+        try:
+            new_objects = drop_watcher.poll()
+            if new_objects:
+                logger.debug("Drop-watcher: %d new object(s) recorded", new_objects)
+        except Exception as exc:
+            logger.warning("Drop-watcher poll error (will retry): %s", exc)
+
+        # Periodic orphan detection
+        now = time.monotonic()
+        if now - last_orphan_check >= orphan_check_interval:
+            try:
+                orphans = drop_watcher.detect_orphans()
+                if orphans:
+                    logger.warning(
+                        "Drop-watcher: %d orphaned object(s) detected "
+                        "(no dispatcher workflow seen within %ds)",
+                        len(orphans),
+                        ctx.minio_drop_orphan_sec,
+                    )
+            except Exception as exc:
+                logger.warning("Orphan detection error: %s", exc)
+            last_orphan_check = now
+
+        ctx.stop_event.wait(timeout=ctx.minio_drop_poll_sec)
+
+
 def _checkpoint_loop(ctx: RunContext, pm: PersistenceManager) -> None:
     """Periodically saves a checkpoint of the full in-memory state."""
     logger = logging.getLogger("observer.checkpoint_loop")
@@ -302,6 +342,13 @@ def main() -> None:
     logger.info("poll_pod_sec      = %ds  (aggressive: podGC 30s on omnipass)", ctx.poll_pod_sec)
     logger.info("poll_metrics_sec  = %ds  (aggressive: podGC 30s on omnipass)", ctx.poll_metrics_sec)
     logger.info("minio_endpoint    = %s", ctx.minio_endpoint or "(not configured)")
+    logger.info(
+        "drop_bucket       = %s (poll=%ds lookback=%ds orphan=%ds)",
+        ctx.minio_drop_bucket or "(not configured)",
+        ctx.minio_drop_poll_sec,
+        ctx.minio_drop_lookback_sec,
+        ctx.minio_drop_orphan_sec,
+    )
     logger.info("artifact_stac     = %s", ctx.corr_use_artifact_stac)
     logger.info("=" * 60)
     if not ctx.minio_endpoint:
@@ -316,6 +363,7 @@ def main() -> None:
     k8s = K8sCollector(ctx)
     stac_col = StacCollector(ctx)
     minio_col = MinioArtifactCollector(ctx)
+    drop_watcher = MinioDropWatcher(ctx)
     correlator = Correlator(ctx)
 
     # Optional resume from checkpoint
@@ -338,6 +386,12 @@ def main() -> None:
 
     # Launch background threads
     threads = [
+        threading.Thread(
+            target=_drop_watcher_loop, args=(ctx, drop_watcher),
+            name="drop-watcher-loop", daemon=True
+            # Polls drop-bucket for new objects; records T0 = object.last_modified.
+            # Must start before workflow-loop so T0 is available when correlator runs.
+        ),
         threading.Thread(
             target=_workflow_loop, args=(ctx, argo, correlator, pm, minio_col),
             name="workflow-loop", daemon=True
