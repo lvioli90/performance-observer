@@ -1,0 +1,122 @@
+# ============================================================
+# Performance Observer Suite - DRY RUN config (single product)
+# ============================================================
+# Use this to validate the full observer pipeline end-to-end
+# before running a full baseline/capacity test.
+#
+# Workflow:
+#   1. python scripts/observe_run.py --config config/dryrun.config.yaml --verbose
+#   2. (in another terminal) python scripts/drop_product.py \
+#        --config config/dryrun.config.yaml \
+#        --file /path/to/IMH01_0_ST__OPT8_....zip
+#   3. Wait for observer to print "STAC published" and stop automatically
+#   4. python scripts/compute_kpis.py --run-dir results/dryrun-001
+#   5. python scripts/plot_results.py  --run-dir results/dryrun-001
+# ============================================================
+
+run_id: "dryrun-001"
+
+# --------------------------------------------------------
+# Argo / Kubernetes
+# --------------------------------------------------------
+argo:
+  namespace: "datalake"
+  workflow_template_filter: ""
+  workflow_label_selector: "partitionkey=pdgs"
+  server_url: ""
+  token: ""
+  verify_tls: true
+
+kubernetes:
+  pod_namespaces:
+    - "datalake"
+  kubeconfig: ""
+  context: "uatmkpl"
+
+# --------------------------------------------------------
+# STAC catalog
+# --------------------------------------------------------
+stac:
+  endpoint: "http://stac-api.datalake.svc/api"
+  public_endpoint: "https://discover-uat.iride.earth"
+  token: ""          # set your Bearer token here for external access
+  collection_id: ""  # resolved from kafka-message.json artifact
+  verify_tls: true
+
+# --------------------------------------------------------
+# MinIO / S3
+# --------------------------------------------------------
+minio:
+  endpoint: "s3.iride.earth"
+  access_key: "4JNpgMzz469ctmm2WMhy"
+  secret_key: "psK7sSXRQyITnuzjo7TxtkSDih8ne3Mz5ChirWGu"
+  artifact_bucket: "datalake-uat-workflows"
+  drop_bucket: "datalake-uat-drop-bucket"
+  drop_prefix: ""
+  drop_poll_sec: 10          # more aggressive for dry run
+  drop_lookback_sec: 60
+  drop_orphan_sec: 120
+  secure: true
+
+# --------------------------------------------------------
+# Polling intervals — more aggressive for quick feedback
+# --------------------------------------------------------
+polling:
+  workflow_status_sec: 10
+  pod_status_sec: 10
+  pod_metrics_sec: 10
+  stac_sec: 15               # poll STAC every 15s to catch publication quickly
+  artifact_check_sec: 10
+  timeseries_flush_sec: 15
+
+# --------------------------------------------------------
+# Timing — dry run: 20 min max + 3 min grace
+# One product through the full pipeline typically takes 3-8 min.
+# The observer stops automatically after max_duration_sec + grace_period_sec
+# or as soon as you Ctrl-C.
+# --------------------------------------------------------
+timing:
+  max_duration_sec: 1200    # 20 min — more than enough for 1 product
+  grace_period_sec: 180     # 3 min after time limit to catch late STAC updates
+
+# --------------------------------------------------------
+# Correlation
+# --------------------------------------------------------
+correlation:
+  dispatcher_template: "ingestion-dispatcher"
+  dispatcher_s3_key_param: "s3-key"
+  dispatcher_s3_bucket_param: "s3-bucket"
+  omnipass_template: "ingestor-omnipass"
+  omnipass_reference_param: "reference"
+  product_id_from_s3_key: "(?P<product_id>[^/]+?)(?:\\.zip|\\.tar\\.gz|\\.tgz|\\.nc|\\.h5)?$"
+  stac_item_id_from_product_id: "{product_id}"
+  use_artifact_stac_discovery: true
+  time_window_fallback_sec: 60
+
+# --------------------------------------------------------
+# Step tracking
+# --------------------------------------------------------
+tracked_steps:
+  - "main"
+  - "resolve-config"
+  - "prepare"
+  - "argo-cwl"
+  - "message-passthrough"
+  - "send-message-success"
+  - "send-message-failure"
+
+# --------------------------------------------------------
+# Semaphore
+# --------------------------------------------------------
+semaphore:
+  configmap_name: "semaphore-ingestors-uat"
+  configmap_key: "workflow"
+  namespace: "datalake"
+
+# --------------------------------------------------------
+# Output
+# --------------------------------------------------------
+output:
+  base_dir: "./results"
+  flush_every_n_records: 5   # flush often during dry run
+  checkpoint_interval_sec: 60
