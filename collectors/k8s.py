@@ -72,8 +72,10 @@ LABEL_STEP = "workflows.argoproj.io/workflow-step-name"   # Argo v3+
 LABEL_STEP_V2 = "workflows.argoproj.io/workflow-node-name"  # alternative label in some builds
 
 _MEMORY_RE = re.compile(r"^(\d+(?:\.\d+)?)(Ki|Mi|Gi|Ti|K|M|G|T)?$")
-# Argo names pods as {workflow-name}-{step-name}-{numeric-hash}
-_ARGO_POD_HASH_RE = re.compile(r"-\d+$")
+# Argo names pods as {workflow-name}-{step-name}-{hash}
+# Hash may be purely numeric (FNV, e.g. "3279871329") or alphanumeric base32
+# (e.g. "fnk7l", "a3b7cd9e"). Match both: 5-15 lowercase alphanumeric chars.
+_ARGO_POD_HASH_RE = re.compile(r"-[a-z0-9]{5,15}$")
 
 
 def _parse_memory_mib(value: str) -> Optional[float]:

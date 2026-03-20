@@ -142,10 +142,11 @@ class Correlator:
 
         # When the omnipass brings a real product_id via its reference parameter,
         # a phantom dispatcher product may exist (created by Fallback 4 when the
-        # drop-watcher was unavailable).  Merge its dispatcher timing into the real
-        # product and remove the phantom so it doesn't pollute the results.
+        # drop-watcher was unavailable, and possibly already claimed by THIS omnipass
+        # via Fallback 3 in a prior poll before the reference param was available).
+        # Merge its dispatcher timing into the real product and remove the phantom.
         if wf_type == _OMNIPASS and wf.object_key:
-            self._merge_phantom_dispatcher(product_id)
+            self._merge_phantom_dispatcher(product_id, omnipass_wf_name=wf.workflow_name)
 
         return product_id
 
@@ -201,11 +202,17 @@ class Correlator:
                     delta,
                 )
 
-    def _merge_phantom_dispatcher(self, real_product_id: str) -> None:
+    def _merge_phantom_dispatcher(
+        self, real_product_id: str, omnipass_wf_name: Optional[str] = None
+    ) -> None:
         """
         After an omnipass resolves a real product_id via the 'reference' parameter,
         check whether a phantom dispatcher product exists (product_id == dispatcher
         workflow name, created by Fallback 4 when the drop-watcher was unavailable).
+
+        The phantom may have been previously claimed by THIS same omnipass via
+        Fallback 3 (in an earlier poll before the reference param was available).
+        In that case ``p.workflow_name`` is already set — we still merge it.
 
         If exactly one such phantom is found, transfer its dispatcher timing to
         the real product (if missing) and delete the phantom from tracking.
@@ -213,11 +220,17 @@ class Correlator:
         with self.ctx._lock:
             phantom_id = None
             for pid, p in list(self.ctx.products.items()):
+                # A phantom created by Fallback 4 always has dispatcher_workflow_name == pid.
+                # It either has no omnipass yet, OR was already claimed by THIS omnipass
+                # via Fallback 3 before the reference param became available.
+                already_claimed_by_this_omnipass = (
+                    omnipass_wf_name and p.workflow_name == omnipass_wf_name
+                )
                 if (
                     pid != real_product_id
                     and p.dispatcher_workflow_name == pid   # Fallback-4 signature
-                    and not p.workflow_name                 # never claimed by omnipass
                     and not p.object_key                    # no s3 key resolved
+                    and (not p.workflow_name or already_claimed_by_this_omnipass)
                 ):
                     if phantom_id is not None:
                         # Multiple phantoms — too ambiguous to merge safely
