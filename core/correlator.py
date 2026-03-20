@@ -595,11 +595,16 @@ class Correlator:
     ) -> None:
         """
         Mark a product as seen in STAC from direct polling (fallback path).
+
+        STAC publication is the authoritative completion signal: once the STAC
+        API confirms the item is updated, the product is considered succeeded
+        regardless of whether the Argo workflow phase has been polled yet.
         """
         with self.ctx._lock:
             product = self.ctx.products.get(product_id)
             if product and product.stac_seen_at is None:
                 product.stac_seen_at = stac_seen_at
+                product.final_status = "succeeded"
                 self.ctx._products_dirty.append(product_id)
 
     # ------------------------------------------------------------------
