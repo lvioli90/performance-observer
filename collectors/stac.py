@@ -77,6 +77,17 @@ class StacCollector:
         self._session = requests.Session()
         if ctx.stac_token:
             self._session.headers["Authorization"] = f"Bearer {ctx.stac_token}"
+            logger.info(
+                "STAC auth: Bearer token configured (length=%d, prefix=%s…)",
+                len(ctx.stac_token),
+                ctx.stac_token[:6],
+            )
+        else:
+            logger.warning(
+                "STAC auth: no token configured — requests to %s will be unauthenticated. "
+                "Set stac.token in config or STAC_TOKEN env var.",
+                ctx.stac_public_endpoint or ctx.stac_endpoint,
+            )
         self._session.verify = ctx.stac_verify_tls
         self._min_request_interval = 0.5
         self._last_request_time = 0.0
@@ -86,8 +97,10 @@ class StacCollector:
         # - internal endpoint otherwise
         if ctx.stac_token and ctx.stac_public_endpoint:
             self._poll_endpoint = ctx.stac_public_endpoint.rstrip("/")
+            logger.info("STAC poll endpoint (authenticated): %s", self._poll_endpoint)
         else:
             self._poll_endpoint = (ctx.stac_endpoint or "").rstrip("/")
+            logger.info("STAC poll endpoint (internal): %s", self._poll_endpoint)
 
     # ------------------------------------------------------------------
     # Main poll
