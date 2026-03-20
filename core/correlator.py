@@ -140,6 +140,13 @@ class Correlator:
         if wf_type == _DISPATCHER and minio_collector is not None:
             self._resolve_t0(product_id, wf, minio_collector)
 
+        # When the omnipass brings a real product_id via its reference parameter,
+        # a phantom dispatcher product may exist (created by Fallback 4 when the
+        # drop-watcher was unavailable).  Merge its dispatcher timing into the real
+        # product and remove the phantom so it doesn't pollute the results.
+        if wf_type == _OMNIPASS and wf.object_key:
+            self._merge_phantom_dispatcher(product_id)
+
         return product_id
 
     def _resolve_t0(self, product_id: str, wf: WorkflowRecord, minio_collector) -> None:
@@ -193,6 +200,52 @@ class Correlator:
                     dispatcher_created.isoformat() if dispatcher_created else "N/A",
                     delta,
                 )
+
+    def _merge_phantom_dispatcher(self, real_product_id: str) -> None:
+        """
+        After an omnipass resolves a real product_id via the 'reference' parameter,
+        check whether a phantom dispatcher product exists (product_id == dispatcher
+        workflow name, created by Fallback 4 when the drop-watcher was unavailable).
+
+        If exactly one such phantom is found, transfer its dispatcher timing to
+        the real product (if missing) and delete the phantom from tracking.
+        """
+        with self.ctx._lock:
+            phantom_id = None
+            for pid, p in list(self.ctx.products.items()):
+                if (
+                    pid != real_product_id
+                    and p.dispatcher_workflow_name == pid   # Fallback-4 signature
+                    and not p.workflow_name                 # never claimed by omnipass
+                    and not p.object_key                    # no s3 key resolved
+                ):
+                    if phantom_id is not None:
+                        # Multiple phantoms — too ambiguous to merge safely
+                        return
+                    phantom_id = pid
+
+            if phantom_id is None:
+                return
+
+            phantom = self.ctx.products[phantom_id]
+            real = self.ctx.products[real_product_id]
+
+            if real.dispatcher_workflow_name is None:
+                real.dispatcher_workflow_name = phantom.dispatcher_workflow_name
+                real.dispatcher_created_at = phantom.dispatcher_created_at
+                real.dispatcher_started_at = phantom.dispatcher_started_at
+                real.dispatcher_finished_at = phantom.dispatcher_finished_at
+                real.dispatcher_status = phantom.dispatcher_status
+            if real.ingest_reference_time is None and phantom.ingest_reference_time is not None:
+                real.ingest_reference_time = phantom.ingest_reference_time
+
+            del self.ctx.products[phantom_id]
+            self.ctx._products_dirty.append(real_product_id)
+
+        logger.info(
+            "Phantom dispatcher product %s merged into %s and removed",
+            phantom_id, real_product_id,
+        )
 
     # ------------------------------------------------------------------
     # Workflow type detection
