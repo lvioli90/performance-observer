@@ -118,6 +118,12 @@ class StacCollector:
             item_id, collection_id = self._resolve_stac_coords(product)
             if not item_id:
                 continue
+            if not collection_id:
+                logger.debug(
+                    "STAC: no collection_id for product_id=%s — skipping until artifact collector provides it",
+                    product.product_id,
+                )
+                continue
 
             try:
                 item = self._fetch_item(collection_id, item_id)
@@ -270,6 +276,11 @@ class StacCollector:
         except requests.exceptions.HTTPError as exc:
             if exc.response is not None and exc.response.status_code == 404:
                 return None
+            if exc.response is not None and exc.response.status_code == 401:
+                raise RuntimeError(
+                    f"STAC API returned 401 Unauthorized for {url} — "
+                    "configure stac_token in your run config (env: STAC_TOKEN)"
+                ) from exc
             raise
 
     def batch_search(
