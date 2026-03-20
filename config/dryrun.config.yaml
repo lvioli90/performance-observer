@@ -40,7 +40,7 @@ stac:
   endpoint: "http://stac-api.datalake.svc/api"
   public_endpoint: "https://discover-uat.iride.earth"
   token: ""          # set your Bearer token here for external access
-  collection_id: ""  # resolved from kafka-message.json artifact
+  collection_id: "PATHFINDER-1BST-OPT8"
   verify_tls: true
 
 # --------------------------------------------------------

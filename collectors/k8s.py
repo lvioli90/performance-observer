@@ -69,9 +69,11 @@ logger = logging.getLogger(__name__)
 # Labels set by Argo on every pod it creates
 LABEL_WORKFLOW = "workflows.argoproj.io/workflow"
 LABEL_STEP = "workflows.argoproj.io/workflow-step-name"   # Argo v3+
-LABEL_STEP_V2 = "argo"                                    # Argo v2 fallback
+LABEL_STEP_V2 = "workflows.argoproj.io/workflow-node-name"  # alternative label in some builds
 
 _MEMORY_RE = re.compile(r"^(\d+(?:\.\d+)?)(Ki|Mi|Gi|Ti|K|M|G|T)?$")
+# Argo names pods as {workflow-name}-{step-name}-{numeric-hash}
+_ARGO_POD_HASH_RE = re.compile(r"-\d+$")
 
 
 def _parse_memory_mib(value: str) -> Optional[float]:
@@ -234,6 +236,13 @@ class K8sCollector:
         labels = meta.labels or {}
         workflow_name = labels.get(LABEL_WORKFLOW, "")
         step_name = labels.get(LABEL_STEP) or labels.get(LABEL_STEP_V2)
+
+        # Fallback: derive step_name from pod_name when labels are absent.
+        # Argo names pods as {workflow-name}-{step-name}-{numeric-hash}, e.g.
+        # pdgs-omnipass-ingestion-40074-qwmkj-main-3279871329 → step "main"
+        if not step_name and workflow_name and pod_name.startswith(workflow_name + "-"):
+            remainder = pod_name[len(workflow_name) + 1:]
+            step_name = _ARGO_POD_HASH_RE.sub("", remainder) or None
 
         # Pod phase
         phase = (status.phase or "Unknown") if status else "Unknown"
