@@ -296,17 +296,16 @@ class ArgoCollector:
 
         ns = self.ctx.argo_namespace
 
-        # Build label selector: require the Argo workflow label (key presence)
-        # and optionally the user-configured selector (e.g. partitionkey=pdgs).
-        label_parts = [LABEL_WORKFLOW]
-        if self.ctx.argo_label_selector:
-            label_parts.append(self.ctx.argo_label_selector)
-        label_selector = ",".join(label_parts)
-
+        # In pod-based mode we only need pods that carry the Argo workflow label.
+        # The argo_label_selector (e.g. "partitionkey=pdgs") is intended for the
+        # Argo Server REST API where it filters at the Workflow CR level — it is
+        # NOT reliable as a pod label filter because Argo does not always propagate
+        # workflow-level labels to pods. Workflow type filtering happens later via
+        # keyword matching on the workflow name.
         try:
             result = self._k8s_core.list_namespaced_pod(
                 namespace=ns,
-                label_selector=label_selector,
+                label_selector=LABEL_WORKFLOW,
                 timeout_seconds=30,
             )
         except Exception as exc:
