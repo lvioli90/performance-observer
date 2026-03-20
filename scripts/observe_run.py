@@ -444,7 +444,20 @@ def main() -> None:
                     ctx.max_duration_sec,
                     ctx.grace_period_sec,
                 )
-                # Wait grace period before stopping (to catch late STAC items)
+                ctx.stop_event.wait(timeout=ctx.grace_period_sec)
+                ctx.request_stop()
+                break
+
+            prods = ctx.snapshot_products()
+
+            # Auto-stop: all known products have been published to STAC
+            if prods and all(p.stac_seen_at is not None for p in prods):
+                logger.info(
+                    "All %d product(s) published to STAC. "
+                    "Entering grace period (%ds) then stopping...",
+                    len(prods),
+                    ctx.grace_period_sec,
+                )
                 ctx.stop_event.wait(timeout=ctx.grace_period_sec)
                 ctx.request_stop()
                 break
@@ -453,16 +466,19 @@ def main() -> None:
             elapsed = ctx.elapsed_sec()
             if int(elapsed) % 60 < 5:
                 wfs = ctx.snapshot_workflows()
-                prods = ctx.snapshot_products()
                 pending = sum(1 for w in wfs if w.phase == "Pending")
                 running = sum(1 for w in wfs if w.phase == "Running")
                 completed = sum(1 for p in prods if p.final_status == "succeeded")
+                stac_done = sum(1 for p in prods if p.stac_seen_at is not None)
                 logger.info(
-                    "[+%dm] workflows: pending=%d running=%d | products: completed=%d",
+                    "[+%dm] workflows: pending=%d running=%d | "
+                    "products: correlated=%d completed=%d stac=%d",
                     int(elapsed / 60),
                     pending,
                     running,
+                    len(prods),
                     completed,
+                    stac_done,
                 )
 
     except KeyboardInterrupt:
