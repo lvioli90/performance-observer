@@ -315,12 +315,21 @@ class ArgoCollector:
 
         pods = result.items or []
 
-        # Group pods by workflow name
+        # Pre-compute the workflow name keywords so we only reconstruct
+        # dispatcher and omnipass workflows (ignore all other Argo workflows).
+        dispatcher_kw = self.ctx.corr_dispatcher_template.lower()
+        omnipass_kw = self.ctx.corr_omnipass_template.lower()
+
+        # Group pods by workflow name, keeping only relevant workflows
         groups: Dict[str, List[Any]] = {}
         for pod in pods:
             wf_name = (pod.metadata.labels or {}).get(LABEL_WORKFLOW)
-            if wf_name:
-                groups.setdefault(wf_name, []).append(pod)
+            if not wf_name:
+                continue
+            wf_lower = wf_name.lower()
+            if dispatcher_kw not in wf_lower and omnipass_kw not in wf_lower:
+                continue
+            groups.setdefault(wf_name, []).append(pod)
 
         # Synthesise one workflow dict per group
         workflows = []

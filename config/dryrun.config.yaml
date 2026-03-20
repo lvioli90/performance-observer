@@ -83,10 +83,10 @@ timing:
 # Correlation
 # --------------------------------------------------------
 correlation:
-  dispatcher_template: "dispatcher"
+  dispatcher_template: "pdgs-iride-dispatcher"
   dispatcher_s3_key_param: "s3-key"
   dispatcher_s3_bucket_param: "s3-bucket"
-  omnipass_template: "omnipass"
+  omnipass_template: "pdgs-omnipass-ingestion"
   omnipass_reference_param: "reference"
   product_id_from_s3_key: "(?P<product_id>[^/]+?)(?:\\.zip|\\.tar\\.gz|\\.tgz|\\.nc|\\.h5)?$"
   stac_item_id_from_product_id: "{product_id}"
