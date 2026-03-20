@@ -133,7 +133,8 @@ class RunContext:
         s = cfg.get("stac", {})
         self.stac_endpoint: str = s.get("endpoint", "")
         self.stac_public_endpoint: str = s.get("public_endpoint", "")
-        self.stac_token: str = s.get("token", "")
+        # Token: config value takes precedence; fall back to STAC_TOKEN env var
+        self.stac_token: str = s.get("token") or os.environ.get("STAC_TOKEN", "")
         self.stac_collection: str = s.get("collection_id", "")
         self.stac_verify_tls: bool = bool(s.get("verify_tls", True))
 
