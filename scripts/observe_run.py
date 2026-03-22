@@ -65,6 +65,19 @@ def _setup_logging(output_dir: Optional[Path] = None, verbose: bool = False) -> 
         handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
     logging.basicConfig(level=level, format=fmt, handlers=handlers)
 
+    # Silence noisy third-party loggers even in verbose mode
+    for noisy in (
+        "urllib3",
+        "requests",
+        "kubernetes",
+        "kubernetes.client",
+        "botocore",
+        "boto3",
+        "s3transfer",
+        "minio",
+    ):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
 
 # ---------------------------------------------------------------------------
 # Rolling window helpers for timeseries
