@@ -291,7 +291,11 @@ class ArgoCollector:
         """
         try:
             self._ensure_k8s_client()
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "ArgoCollector: Kubernetes client init failed — pod-based mode unavailable: %s",
+                exc,
+            )
             return []
 
         ns = self.ctx.argo_namespace
