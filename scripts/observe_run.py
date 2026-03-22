@@ -71,6 +71,7 @@ def _setup_logging(output_dir: Optional[Path] = None, verbose: bool = False) -> 
         "requests",
         "kubernetes",
         "kubernetes.client",
+        "kubernetes.client.rest",
         "botocore",
         "boto3",
         "s3transfer",
