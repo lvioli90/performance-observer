@@ -223,13 +223,23 @@ correlation:
 # while pods are Running, not after completion. The pod_metrics_sec
 # polling interval above is set aggressively for this reason.
 tracked_steps:
-  - "main"               # dispatcher: core dispatch logic
-  - "resolve-config"     # omnipass: partitionkey config resolution
-  - "prepare"            # omnipass: CWL param preparation (has retry)
-  - "argo-cwl"           # omnipass: calrissian runner (heaviest step)
+  # --- ingestion-dispatcher ---
+  - "main"               # core dispatch logic
+  # --- ingestor-omnipass ---
+  - "resolve-config"     # partitionkey config resolution
+  - "prepare"            # CWL param preparation (has retry)
+  - "argo-cwl"           # calrissian runner (heaviest step, spawns sub-pods)
+  - "resolve-exit-config"
   - "message-passthrough"
   - "send-message-success"
   - "send-message-failure"
+  # --- argo-cwl-runner (sub-steps inside argo-cwl) ---
+  - "cwl-prepare"        # prepares CWL document and inputs
+  - "stage-in"           # stages in input data (Directory type)
+  - "cwl-runner"         # Calrissian job (actual CWL execution)
+  - "get-results"        # reads output/log/report from /calrissian/
+  - "stage-out"          # uploads STAC catalog to S3
+  - "post-results"       # publishes to STAC API (conditional)
 
 # --------------------------------------------------------
 # Semaphore monitoring

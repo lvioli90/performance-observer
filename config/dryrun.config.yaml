@@ -97,13 +97,23 @@ correlation:
 # Step tracking
 # --------------------------------------------------------
 tracked_steps:
+  # --- ingestion-dispatcher ---
   - "main"
+  # --- ingestor-omnipass ---
   - "resolve-config"
   - "prepare"
   - "argo-cwl"
+  - "resolve-exit-config"
   - "message-passthrough"
   - "send-message-success"
   - "send-message-failure"
+  # --- argo-cwl-runner (sub-steps inside argo-cwl) ---
+  - "cwl-prepare"
+  - "stage-in"
+  - "cwl-runner"
+  - "get-results"
+  - "stage-out"
+  - "post-results"
 
 # --------------------------------------------------------
 # Semaphore
