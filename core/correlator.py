@@ -303,6 +303,13 @@ class Correlator:
           3. Nearest drop event regardless of time (works when observer started late)
           4. Workflow name itself as product_id (last resort, always succeeds)
         """
+        # Already correlated on a previous poll — skip fallback chain so the
+        # caller can still update dispatcher timing (started_at, finished_at).
+        with self.ctx._lock:
+            for prod in self.ctx.products.values():
+                if prod.dispatcher_workflow_name == wf.workflow_name:
+                    return prod.product_id
+
         s3_key_param = self.ctx.corr_dispatcher_s3_key_param
         s3_bucket_param = self.ctx.corr_dispatcher_s3_bucket_param
 
@@ -366,6 +373,13 @@ class Correlator:
           2. Dispatcher timing time-window match
           3. Any unclaimed dispatcher product (for dryrun with 1 product)
         """
+        # Already correlated on a previous poll — skip fallback chain so the
+        # caller can still update omnipass timing (started_at, finished_at, phase).
+        with self.ctx._lock:
+            for prod in self.ctx.products.values():
+                if prod.workflow_name == wf.workflow_name:
+                    return prod.product_id
+
         reference_param = self.ctx.corr_omnipass_reference_param
         reference = wf.parameters.get(reference_param, "")
 

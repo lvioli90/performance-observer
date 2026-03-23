@@ -166,6 +166,7 @@ class StacCollector:
                     prod_record = self.ctx.products.get(product.product_id)
                     if prod_record and prod_record.stac_seen_at is None:
                         prod_record.stac_seen_at = published_at
+                        prod_record.final_status = "succeeded"
                         self.ctx._products_dirty.append(product.product_id)
 
                 newly_found.append(stac_record)
