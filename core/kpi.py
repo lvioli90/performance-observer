@@ -354,14 +354,14 @@ class KPIEngine:
                 # Pending (scheduling delay, PVC mount, image pull)
                 "pending_avg": _safe_mean(pending_vals),
                 "pending_p95": _percentile(pending_vals, 95),
-                # Running (container execution time only)
-                "duration_avg": _safe_mean(running_vals),
-                "duration_p50": _percentile(running_vals, 50),
-                "duration_p95": _percentile(running_vals, 95),
-                # Wall-clock = pending + running (matches Argo UI, use for bottleneck analysis)
-                "wall_clock_avg": _safe_mean(wall_vals),
-                "wall_clock_p50": _percentile(wall_vals, 50),
-                "wall_clock_p95": _percentile(wall_vals, 95),
+                # Duration = full pod lifecycle (pending + running) — matches Argo UI
+                "duration_avg": _safe_mean(wall_vals),
+                "duration_p50": _percentile(wall_vals, 50),
+                "duration_p95": _percentile(wall_vals, 95),
+                # Running = container execution only (excludes scheduling/mount time)
+                "running_avg": _safe_mean(running_vals),
+                "running_p50": _percentile(running_vals, 50),
+                "running_p95": _percentile(running_vals, 95),
                 # CPU (milli-cores)
                 "cpu_avg": _safe_mean(cpu_avg_vals),
                 "cpu_peak_avg": _safe_mean(cpu_peak_vals),
@@ -412,10 +412,10 @@ class KPIEngine:
 
         # CASE B: pod execution bottleneck
         for step in steps:
-            if step.get("wall_clock_p95") and step["wall_clock_p95"] > 120:
+            if step.get("duration_p95") and step["duration_p95"] > 120:
                 hints.append(
                     f"CASE B (pod execution bottleneck): step '{step['step_name']}' "
-                    f"wall_clock p95={step['wall_clock_p95']:.0f}s. "
+                    f"duration p95={step['duration_p95']:.0f}s. "
                     "Check pod logic or external dependency latency."
                 )
 
@@ -423,14 +423,14 @@ class KPIEngine:
         for step in steps:
             if (
                 step.get("cpu_peak_max") is not None
-                and step.get("wall_clock_p95") is not None
+                and step.get("duration_p95") is not None
                 and step["cpu_peak_max"] > 800  # >800 milli-cores
-                and step["wall_clock_p95"] > 60
+                and step["duration_p95"] > 60
             ):
                 hints.append(
                     f"CASE C (CPU-bound): step '{step['step_name']}' "
                     f"cpu_peak_max={step['cpu_peak_max']:.0f}m, "
-                    f"wall_clock_p95={step['wall_clock_p95']:.0f}s. "
+                    f"duration_p95={step['duration_p95']:.0f}s. "
                     "Consider increasing CPU limits or optimizing code."
                 )
             if step.get("cpu_throttling_avg") and step["cpu_throttling_avg"] > 0.1:
@@ -452,14 +452,14 @@ class KPIEngine:
         # CASE E: external dependency bottleneck (low CPU, high wall-clock time)
         for step in steps:
             if (
-                step.get("wall_clock_p95") is not None
+                step.get("duration_p95") is not None
                 and step.get("cpu_peak_max") is not None
-                and step["wall_clock_p95"] > 60
+                and step["duration_p95"] > 60
                 and step["cpu_peak_max"] < 200  # <200 milli-cores
             ):
                 hints.append(
                     f"CASE E (external dependency wait): step '{step['step_name']}' "
-                    f"wall_clock_p95={step['wall_clock_p95']:.0f}s but "
+                    f"duration_p95={step['duration_p95']:.0f}s but "
                     f"cpu_peak_max={step['cpu_peak_max']:.0f}m (low). "
                     "Likely waiting on MinIO, STAC API, or another external service."
                 )
