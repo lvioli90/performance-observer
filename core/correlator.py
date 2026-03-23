@@ -700,6 +700,56 @@ class Correlator:
                 self.ctx._products_dirty.append(product_id)
 
     # ------------------------------------------------------------------
+    # Orphan drop registration
+    # ------------------------------------------------------------------
+
+    def register_orphan_drop(
+        self,
+        s3_key: str,
+        t0: "datetime",
+        s3_bucket: str = "",
+    ) -> Optional[str]:
+        """
+        Create a ProductRecord for a drop-bucket object that was never picked
+        up by a dispatcher workflow (orphan = trigger failure).
+
+        Called by the drop-watcher loop after ``drop_orphan_sec`` expires.
+        Sets ``final_status="failed"`` so the product is counted correctly by
+        the KPI engine's failure metrics.
+
+        Returns the product_id if a new record was created, None if the
+        product is already tracked (dispatcher arrived late after all).
+        """
+        product_id = self._extract_product_id_from_s3_key(s3_key)
+        if not product_id:
+            # Fall back to filename without extension
+            product_id = s3_key.rsplit("/", 1)[-1].rsplit(".", 1)[0] or s3_key
+
+        bucket = s3_bucket or self.ctx.minio_drop_bucket or ""
+        object_key = f"s3://{bucket}/{s3_key}" if bucket else s3_key
+
+        with self.ctx._lock:
+            # If a dispatcher arrived late and already created the record, skip.
+            if product_id in self.ctx.products:
+                return None
+            record = ProductRecord(
+                run_id=self.ctx.run_id,
+                product_id=product_id,
+                object_key=object_key,
+                ingest_reference_time=t0,
+                final_status="failed",
+            )
+            self.ctx.products[product_id] = record
+            self.ctx._products_dirty.append(product_id)
+
+        logger.warning(
+            "Orphan drop registered as failed product: s3_key=%s product_id=%s "
+            "(trigger failure — no dispatcher workflow observed within %ds)",
+            s3_key, product_id, self.ctx.minio_drop_orphan_sec,
+        )
+        return product_id
+
+    # ------------------------------------------------------------------
     # Time-window fallback (informational)
     # ------------------------------------------------------------------
 

@@ -259,10 +259,17 @@ def _artifact_loop(
 def _drop_watcher_loop(
     ctx: RunContext,
     drop_watcher: MinioDropWatcher,
+    correlator: "Correlator",
+    pm: "PersistenceManager",
 ) -> None:
     """
     Polls the MinIO drop-bucket for new objects and records T0 in real-time.
     Periodically runs orphan detection to flag objects never picked up by Argo.
+
+    When an orphan is detected (drop seen but no dispatcher within orphan_sec),
+    a failed ProductRecord is created immediately so that all dropped products
+    are tracked in the final KPI count — not just the ones that made it through
+    the full dispatcher → omnipass pipeline.
     """
     logger = logging.getLogger("observer.drop_watcher_loop")
     orphan_check_interval = max(ctx.minio_drop_orphan_sec // 4, 30)
@@ -288,6 +295,20 @@ def _drop_watcher_loop(
                         len(orphans),
                         ctx.minio_drop_orphan_sec,
                     )
+                    for orphan in orphans:
+                        t0_str = orphan.get("t0")
+                        try:
+                            t0 = datetime.fromisoformat(t0_str) if t0_str else None
+                        except ValueError:
+                            t0 = None
+                        if t0 is None:
+                            t0 = datetime.now(timezone.utc)
+                        pid = correlator.register_orphan_drop(
+                            s3_key=orphan["s3_key"],
+                            t0=t0,
+                        )
+                        if pid:
+                            pm.flush_dirty_products(ctx)
             except Exception as exc:
                 logger.warning("Orphan detection error: %s", exc)
             last_orphan_check = now
@@ -401,10 +422,11 @@ def main() -> None:
     # Launch background threads
     threads = [
         threading.Thread(
-            target=_drop_watcher_loop, args=(ctx, drop_watcher),
+            target=_drop_watcher_loop, args=(ctx, drop_watcher, correlator, pm),
             name="drop-watcher-loop", daemon=True
             # Polls drop-bucket for new objects; records T0 = object.last_modified.
             # Must start before workflow-loop so T0 is available when correlator runs.
+            # Also registers orphan drops as failed ProductRecords after orphan_sec.
         ),
         threading.Thread(
             target=_workflow_loop, args=(ctx, argo, correlator, pm, minio_col),
