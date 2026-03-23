@@ -464,12 +464,34 @@ def main() -> None:
 
             prods = ctx.snapshot_products()
 
-            # Auto-stop: all known products have been published to STAC
-            if prods and all(p.stac_seen_at is not None for p in prods):
+            # Auto-stop when every product we actively dropped (T0 recorded by
+            # drop-watcher) has reached a terminal state: STAC published or failed.
+            # Pre-existing workflows picked up at startup are excluded so that a
+            # stale failed run from before this session does not block auto-stop.
+            our_s3_keys = set(ctx.drop_bucket_events.keys())
+            if our_s3_keys:
+                # ProductRecord.object_key is "s3://bucket/key"; match by suffix.
+                our_prods = [
+                    p for p in prods
+                    if p.object_key and any(
+                        p.object_key.endswith("/" + k) or p.object_key == k
+                        for k in our_s3_keys
+                    )
+                ]
+            else:
+                our_prods = prods
+
+            def _terminal(p) -> bool:
+                return p.stac_seen_at is not None or p.final_status in ("failed", "timeout")
+
+            if our_prods and all(_terminal(p) for p in our_prods):
+                n_stac   = sum(1 for p in our_prods if p.stac_seen_at is not None)
+                n_failed = sum(1 for p in our_prods if p.final_status in ("failed", "timeout"))
                 logger.info(
-                    "All %d product(s) published to STAC. "
+                    "All %d tracked product(s) terminal "
+                    "(%d STAC published, %d failed/timeout). "
                     "Entering grace period (%ds) then stopping...",
-                    len(prods),
+                    len(our_prods), n_stac, n_failed,
                     ctx.grace_period_sec,
                 )
                 ctx.stop_event.wait(timeout=ctx.grace_period_sec)
@@ -483,15 +505,17 @@ def main() -> None:
                 pending = sum(1 for w in wfs if w.phase == "Pending")
                 running = sum(1 for w in wfs if w.phase == "Running")
                 completed = sum(1 for p in prods if p.final_status == "succeeded")
+                failed    = sum(1 for p in prods if p.final_status in ("failed", "timeout"))
                 stac_done = sum(1 for p in prods if p.stac_seen_at is not None)
                 logger.info(
                     "[+%dm] workflows: pending=%d running=%d | "
-                    "products: correlated=%d completed=%d stac=%d",
+                    "products: correlated=%d completed=%d failed=%d stac=%d",
                     int(elapsed / 60),
                     pending,
                     running,
                     len(prods),
                     completed,
+                    failed,
                     stac_done,
                 )
 

@@ -2,28 +2,33 @@
 """
 scripts/drop_product.py
 =======================
-Upload a single product file to the MinIO drop-bucket to trigger the
+Upload one or more product files to the MinIO drop-bucket to trigger the
 ingestion-dispatcher workflow.
 
-Use this for dry-run validation before a full load test.
-
-Usage
------
+Usage — single file
+-------------------
   python scripts/drop_product.py \\
       --config config/dryrun.config.yaml \\
       --file /path/to/IMH01_0_ST__OPT8_20251219T....zip
 
-  # Upload to a specific prefix inside the bucket
+Usage — batch (directory of products)
+--------------------------------------
   python scripts/drop_product.py \\
-      --config config/dryrun.config.yaml \\
-      --file /path/to/product.zip \\
-      --prefix some/subdir/
+      --config config/uat.config.yaml \\
+      --dir /path/to/products/ \\
+      --interval 5          # seconds between drops (default: 0)
+      --pattern "*.zip"     # glob filter (default: *.zip)
 
-  # Dry-run: print what would happen without actually uploading
+  # Dry-run first to check what would be dropped:
   python scripts/drop_product.py \\
-      --config config/dryrun.config.yaml \\
-      --file /path/to/product.zip \\
+      --config config/uat.config.yaml \\
+      --dir /path/to/products/ \\
       --dry-run
+
+Options
+-------
+  --prefix   Object key prefix inside the bucket (default: root)
+  --dry-run  Print what would happen without uploading
 
 The script prints the expected product_id and the MinIO object key so you
 can cross-check with the observer log.
@@ -33,9 +38,9 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import re
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -61,17 +66,69 @@ def _extract_product_id(filename: str, regex: str) -> str | None:
     return None
 
 
+def _upload_one(client, ctx: "RunContext", local_path: Path, prefix: str, dry_run: bool) -> bool:
+    """Upload a single file. Returns True on success."""
+    from minio.error import S3Error
+
+    filename   = local_path.name
+    object_key = f"{prefix}/{filename}" if prefix else filename
+    bucket     = ctx.minio_drop_bucket
+
+    product_id   = _extract_product_id(filename, ctx.corr_product_id_s3_key_regex)
+    stac_item_id = ctx.derive_stac_item_id(product_id) if product_id else "unknown"
+
+    print()
+    print(f"  {'[DRY RUN] ' if dry_run else ''}Uploading: {filename}")
+    print(f"    S3 URL      : s3://{bucket}/{object_key}")
+    print(f"    product_id  : {product_id or '(could not extract)'}")
+    print(f"    STAC item   : {stac_item_id}")
+
+    if dry_run:
+        return True
+
+    file_size = local_path.stat().st_size
+    logger.info("Uploading %s → s3://%s/%s (%d bytes)...", filename, bucket, object_key, file_size)
+    try:
+        with open(local_path, "rb") as fh:
+            client.put_object(
+                bucket_name=bucket,
+                object_name=object_key,
+                data=fh,
+                length=file_size,
+            )
+        logger.info("  ✓ Uploaded: %s", filename)
+        return True
+    except S3Error as exc:
+        logger.error("  ✗ Upload failed for %s: %s", filename, exc)
+        return False
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Upload a product file to the MinIO drop-bucket"
+        description="Upload product file(s) to the MinIO drop-bucket"
     )
     parser.add_argument(
         "--config", required=True,
         help="Path to observer YAML config (e.g. config/dryrun.config.yaml)"
     )
+
+    src = parser.add_mutually_exclusive_group(required=True)
+    src.add_argument(
+        "--file", metavar="FILE",
+        help="Single product file to upload"
+    )
+    src.add_argument(
+        "--dir", metavar="DIR",
+        help="Directory of product files to upload (batch mode)"
+    )
+
     parser.add_argument(
-        "--file", required=True,
-        help="Local path to the product file to upload"
+        "--pattern", default="*.zip",
+        help="Glob pattern when using --dir (default: *.zip)"
+    )
+    parser.add_argument(
+        "--interval", type=float, default=0.0, metavar="SEC",
+        help="Seconds to wait between drops in batch mode (default: 0)"
     )
     parser.add_argument(
         "--prefix", default="",
@@ -87,50 +144,49 @@ def main() -> None:
     cfg = load_config(args.config)
     ctx = RunContext(cfg)
 
-    local_path = Path(args.file)
-    if not local_path.exists():
-        logger.error("File not found: %s", local_path)
-        sys.exit(1)
+    # Collect files to drop
+    if args.file:
+        files = [Path(args.file)]
+        if not files[0].exists():
+            logger.error("File not found: %s", files[0])
+            sys.exit(1)
+    else:
+        dir_path = Path(args.dir)
+        if not dir_path.is_dir():
+            logger.error("Directory not found: %s", dir_path)
+            sys.exit(1)
+        files = sorted(dir_path.glob(args.pattern))
+        if not files:
+            logger.error("No files matching '%s' in %s", args.pattern, dir_path)
+            sys.exit(1)
 
-    filename = local_path.name
     prefix = args.prefix.strip("/")
-    object_key = f"{prefix}/{filename}" if prefix else filename
-    bucket = ctx.minio_drop_bucket
-
-    # Derive expected product_id
-    product_id = _extract_product_id(filename, ctx.corr_product_id_s3_key_regex)
-    stac_item_id = ctx.derive_stac_item_id(product_id) if product_id else "unknown"
 
     print()
     print("=" * 60)
-    print("  Drop-product dry run" if args.dry_run else "  Drop-product upload")
+    print(f"  Drop-product {'DRY RUN' if args.dry_run else 'UPLOAD'}")
     print("=" * 60)
-    print(f"  Local file   : {local_path} ({local_path.stat().st_size / 1e6:.1f} MB)")
-    print(f"  Bucket       : {bucket}")
-    print(f"  Object key   : {object_key}")
-    print(f"  S3 URL       : s3://{bucket}/{object_key}")
-    print(f"  product_id   : {product_id or '(could not extract)'}")
-    print(f"  STAC item id : {stac_item_id}")
-    print(f"  MinIO endpt  : {'https' if ctx.minio_secure else 'http'}://{ctx.minio_endpoint}")
+    print(f"  Bucket      : {ctx.minio_drop_bucket}")
+    print(f"  MinIO       : {'https' if ctx.minio_secure else 'http'}://{ctx.minio_endpoint}")
+    print(f"  Files       : {len(files)}")
+    if args.interval > 0:
+        print(f"  Interval    : {args.interval}s between drops")
     print("=" * 60)
 
     if args.dry_run:
-        print("\n[DRY RUN] No file uploaded. Remove --dry-run to upload.")
+        for f in files:
+            _upload_one(None, ctx, f, prefix, dry_run=True)
+        print("\n[DRY RUN] No files uploaded. Remove --dry-run to upload.")
         return
 
-    # Upload
+    # Build MinIO client
     try:
         from minio import Minio
-        from minio.error import S3Error
     except ImportError:
         logger.error("minio package not installed. Run: pip install minio")
         sys.exit(1)
 
-    endpoint = (
-        ctx.minio_endpoint
-        .replace("http://", "")
-        .replace("https://", "")
-    )
+    endpoint = ctx.minio_endpoint.replace("http://", "").replace("https://", "")
     client = Minio(
         endpoint=endpoint,
         access_key=ctx.minio_access_key or None,
@@ -138,31 +194,24 @@ def main() -> None:
         secure=ctx.minio_secure,
     )
 
-    file_size = local_path.stat().st_size
-    logger.info("Uploading %s → s3://%s/%s (%d bytes)...", filename, bucket, object_key, file_size)
+    # Upload
+    ok = failed = 0
+    for i, local_path in enumerate(files):
+        success = _upload_one(client, ctx, local_path, prefix, dry_run=False)
+        if success:
+            ok += 1
+        else:
+            failed += 1
+        if args.interval > 0 and i < len(files) - 1:
+            logger.info("Waiting %.1fs before next drop...", args.interval)
+            time.sleep(args.interval)
 
-    try:
-        with open(local_path, "rb") as fh:
-            client.put_object(
-                bucket_name=bucket,
-                object_name=object_key,
-                data=fh,
-                length=file_size,
-            )
-    except S3Error as exc:
-        logger.error("Upload failed: %s", exc)
-        sys.exit(1)
-
-    logger.info("Upload complete.")
     print()
-    print("Next steps:")
-    print(f"  Watch the observer log for: product_id={product_id}")
-    print(f"  Expected dispatcher param:  s3-key={object_key}")
-    print(f"  Expected omnipass param:    reference=s3://{bucket}/{object_key}")
-    print()
-    print("The observer will confirm STAC publication when it logs:")
-    print(f"  STAC published: product_id={product_id} ... updated=<timestamp>")
-    print()
+    print(f"Done: {ok} uploaded, {failed} failed.")
+    if ok > 0:
+        print()
+        print("Observer will log product_id for each file and stop automatically")
+        print("when all products reach a terminal state (STAC published or failed).")
 
 
 if __name__ == "__main__":
