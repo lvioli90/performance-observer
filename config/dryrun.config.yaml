@@ -110,7 +110,7 @@ tracked_steps:
   # --- argo-cwl-runner (sub-steps inside argo-cwl) ---
   - "cwl-prepare"
   - "stage-in"
-  - "cwl-runner"
+  - "calrissian-argo-wf-runner"  # Calrissian K8s Job pod (actual CWL execution)
   - "get-results"
   - "stage-out"
   - "post-results"

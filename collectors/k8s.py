@@ -246,6 +246,17 @@ class K8sCollector:
             remainder = pod_name[len(workflow_name) + 1:]
             step_name = _ARGO_POD_HASH_RE.sub("", remainder) or None
 
+        # Fallback: Calrissian pods are created via a K8s Job and named
+        # {step-name}-{wf-short-uid}-{pod-suffix}, e.g.:
+        #   calrissian-argo-wf-runner-zdk42-jk2b6
+        # They carry job-name=calrissian-argo-wf-runner-{wf-short-uid} but
+        # their pod name does NOT start with the workflow name, so the
+        # previous fallback does not fire.  Derive step from job-name label.
+        if not step_name:
+            job_name = labels.get("job-name", "")
+            if job_name:
+                step_name = _ARGO_POD_HASH_RE.sub("", job_name) or None
+
         # Pod phase
         phase = (status.phase or "Unknown") if status else "Unknown"
 

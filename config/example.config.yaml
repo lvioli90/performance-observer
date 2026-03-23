@@ -236,7 +236,7 @@ tracked_steps:
   # --- argo-cwl-runner (sub-steps inside argo-cwl) ---
   - "cwl-prepare"        # prepares CWL document and inputs
   - "stage-in"           # stages in input data (Directory type)
-  - "cwl-runner"         # Calrissian job (actual CWL execution)
+  - "calrissian-argo-wf-runner"  # Calrissian K8s Job pod (actual CWL execution)
   - "get-results"        # reads output/log/report from /calrissian/
   - "stage-out"          # uploads STAC catalog to S3
   - "post-results"       # publishes to STAC API (conditional)
