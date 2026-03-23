@@ -452,9 +452,18 @@ class Correlator:
         self, wf: WorkflowRecord
     ) -> Optional[str]:
         """
-        Find a dispatcher-correlated ProductRecord whose dispatcher finished
-        within corr_time_window_sec before this omnipass started.
+        Find a dispatcher-correlated ProductRecord whose dispatcher timing
+        overlaps with this omnipass start within corr_time_window_sec.
         Used when omnipass pod annotations don't carry the 'reference' parameter.
+
+        Anchor selection:
+          - dispatcher_finished_at  if available (precise: end of dispatcher)
+          - dispatcher_created_at   fallback (omnipass may start before dispatcher
+            finishes — pipeline_gap can be negative when Kafka is sent mid-run)
+
+        Delta sign:
+          Both positive (omnipass after dispatcher) and negative (omnipass starts
+          before dispatcher finishes) are valid.  We accept |delta| <= window.
         """
         if wf.created_at is None:
             return None
@@ -465,12 +474,15 @@ class Correlator:
         best_delta: Optional[float] = None
         for prod in products:
             # Only match products that have a dispatcher but no omnipass yet
-            if not prod.dispatcher_finished_at:
-                continue
             if prod.workflow_name:
                 continue  # already has an omnipass
-            delta = (wf.created_at - prod.dispatcher_finished_at).total_seconds()
-            if 0 <= delta <= window and (best_delta is None or delta < best_delta):
+            # Use finished_at when available; fall back to created_at so we can
+            # still match when the dispatcher is still running at poll time.
+            anchor = prod.dispatcher_finished_at or prod.dispatcher_created_at
+            if not anchor:
+                continue
+            delta = abs((wf.created_at - anchor).total_seconds())
+            if delta <= window and (best_delta is None or delta < best_delta):
                 best_delta = delta
                 best_id = prod.product_id
         return best_id
