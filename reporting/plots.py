@@ -309,7 +309,9 @@ def plot_step_duration_comparison(
         logger.warning("No step KPI data for duration plot")
         return None
 
-    steps = [s["step_name"] for s in step_kpis]
+    steps = [
+        f"{s.get('workflow_type', 'unknown')}/{s['step_name']}" for s in step_kpis
+    ]
     p50s = [_safe_float(s.get("duration_p50")) or 0 for s in step_kpis]
     p95s = [_safe_float(s.get("duration_p95")) or 0 for s in step_kpis]
 
@@ -343,7 +345,9 @@ def plot_step_cpu_peak(step_kpis: List[dict], output_dir: Path) -> Optional[Path
     if not step_kpis:
         return None
 
-    steps = [s["step_name"] for s in step_kpis]
+    steps = [
+        f"{s.get('workflow_type', 'unknown')}/{s['step_name']}" for s in step_kpis
+    ]
     avg_peaks = [_safe_float(s.get("cpu_peak_avg")) or 0 for s in step_kpis]
     max_peaks = [_safe_float(s.get("cpu_peak_max")) or 0 for s in step_kpis]
 
@@ -377,7 +381,9 @@ def plot_step_mem_peak(step_kpis: List[dict], output_dir: Path) -> Optional[Path
     if not step_kpis:
         return None
 
-    steps = [s["step_name"] for s in step_kpis]
+    steps = [
+        f"{s.get('workflow_type', 'unknown')}/{s['step_name']}" for s in step_kpis
+    ]
     avg_peaks = [_safe_float(s.get("mem_peak_avg")) or 0 for s in step_kpis]
     max_peaks = [_safe_float(s.get("mem_peak_max")) or 0 for s in step_kpis]
 

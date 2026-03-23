@@ -143,6 +143,15 @@ class KPIEngine:
     timeseries: list of dict  (ordered chronologically)
     run_started_at : datetime or None
     run_finished_at: datetime or None
+    dispatcher_template : str
+        Substring used to identify dispatcher workflows (default "ingestion-dispatcher").
+    omnipass_template : str
+        Substring used to identify omnipass workflows (default "ingestor-omnipass").
+    stac_ref_steps : list of str
+        Step names (in priority order) whose pod finish time is used as the
+        reference for stac_latency.  The omnipass exit-handler runs AFTER STAC
+        is published, so workflow_finished_at is unsuitable; the last main-workflow
+        step (typically "post-results") is the correct reference.
     """
 
     def __init__(
@@ -153,6 +162,9 @@ class KPIEngine:
         timeseries: List[dict],
         run_started_at: Optional[datetime] = None,
         run_finished_at: Optional[datetime] = None,
+        dispatcher_template: str = "ingestion-dispatcher",
+        omnipass_template: str = "ingestor-omnipass",
+        stac_ref_steps: Optional[List[str]] = None,
     ):
         # Compute derived fields in-place on copies so originals are not mutated
         self.workflows = [compute_workflow_derived(dict(w)) for w in workflows]
@@ -161,6 +173,61 @@ class KPIEngine:
         self.timeseries = timeseries
         self.run_started_at = run_started_at
         self.run_finished_at = run_finished_at or datetime.now(timezone.utc)
+        self.dispatcher_template = dispatcher_template.lower()
+        self.omnipass_template = omnipass_template.lower()
+        # Steps whose finish time marks "STAC has been posted" in the omnipass workflow.
+        # The exit-handler steps (message-passthrough, send-message-success) run AFTER
+        # STAC is published, so they must not be used as the reference.
+        self.stac_ref_steps: List[str] = stac_ref_steps or [
+            "post-results",
+            "stage-out",
+            "calrissian-argo-wf-runner",
+        ]
+        # Index: workflow_name → {step_name → latest pod_finished_at (datetime)}
+        self._pod_finish_index: Dict[str, Dict[str, datetime]] = self._build_pod_finish_index()
+
+    # ------------------------------------------------------------------
+    # Pod finish index
+    # ------------------------------------------------------------------
+
+    def _build_pod_finish_index(self) -> Dict[str, Dict[str, datetime]]:
+        """
+        Build workflow_name → {step_name → latest pod_finished_at} mapping.
+
+        Used by business_kpis() to resolve the correct stac_latency reference
+        point (last main-workflow step finish) without relying on
+        workflow_finished_at which, in pod-based mode, reflects exit-handler
+        pod times rather than the end of the CWL computation.
+        """
+        index: Dict[str, Dict[str, datetime]] = defaultdict(dict)
+        for pod in self.pods:
+            wf = pod.get("workflow_name")
+            step = pod.get("step_name")
+            finished_str = pod.get("pod_finished_at")
+            if not (wf and step and finished_str):
+                continue
+            finished = _parse_dt(finished_str)
+            if finished is None:
+                continue
+            existing = index[wf].get(step)
+            if existing is None or finished > existing:
+                index[wf][step] = finished
+        return dict(index)
+
+    def _stac_ref_time(self, product: dict) -> Optional[datetime]:
+        """
+        Return the best available finish time of the last STAC-posting step
+        for *product*.  Falls back to workflow_finished_at when no matching
+        pod is found.
+        """
+        wf_name = product.get("workflow_name")
+        wf_steps = self._pod_finish_index.get(wf_name or "") or {}
+        for step in self.stac_ref_steps:
+            t = wf_steps.get(step)
+            if t is not None:
+                return t
+        # Fallback: workflow_finished_at from the product record itself
+        return _parse_dt(product.get("workflow_finished_at"))
 
     # ------------------------------------------------------------------
     # Business KPIs
@@ -196,11 +263,20 @@ class KPIEngine:
             if p.get("end_to_end_sec") is not None
         ]
 
-        stac_latency_values = [
-            p["stac_publish_sec"]
-            for p in completed
-            if p.get("stac_publish_sec") is not None
-        ]
+        # stac_latency = stac_seen_at - last_main_step_finish_time.
+        # The omnipass exit-handler runs AFTER STAC is published (negative latency
+        # if we used workflow_finished_at).  Use the pod finish time of the last
+        # STAC-posting step (post-results / stage-out) as the reference instead.
+        stac_latency_values = []
+        for p in completed:
+            stac_seen = _parse_dt(p.get("stac_seen_at"))
+            if stac_seen is None:
+                continue
+            ref = self._stac_ref_time(p)
+            if ref is None:
+                continue
+            val = (stac_seen - ref).total_seconds()
+            stac_latency_values.append(val)
 
         return {
             "total_products_observed": total_observed,
@@ -311,17 +387,26 @@ class KPIEngine:
 
     def step_kpis(self) -> List[dict]:
         """
-        Compute per-step KPIs.
+        Compute per-step KPIs, split by workflow type (dispatcher / omnipass).
 
-        Returns a list of dicts, one per unique step_name observed.
+        Returns a list of dicts, one per unique (workflow_type, step_name) pair,
+        sorted by workflow_type then step_name.
         """
-        by_step: Dict[str, List[dict]] = defaultdict(list)
+        # Group pods by (workflow_type, step_name)
+        by_key: Dict[Tuple[str, str], List[dict]] = defaultdict(list)
         for pod in self.pods:
             step = pod.get("step_name") or "unknown"
-            by_step[step].append(pod)
+            wf_name = (pod.get("workflow_name") or "").lower()
+            if self.dispatcher_template and self.dispatcher_template in wf_name:
+                wf_type = "dispatcher"
+            elif self.omnipass_template and self.omnipass_template in wf_name:
+                wf_type = "omnipass"
+            else:
+                wf_type = "unknown"
+            by_key[(wf_type, step)].append(pod)
 
         results = []
-        for step_name, step_pods in sorted(by_step.items()):
+        for (wf_type, step_name), step_pods in sorted(by_key.items()):
             total = len(step_pods)
             failed_pods = [p for p in step_pods if p.get("pod_phase") == "Failed"]
             retry_pods = [p for p in step_pods if (p.get("retries") or 0) > 0]
@@ -343,6 +428,7 @@ class KPIEngine:
             throttle_vals = [p["cpu_throttling"] for p in step_pods if p.get("cpu_throttling") is not None]
 
             results.append({
+                "workflow_type": wf_type,
                 "step_name": step_name,
                 "total_executions": total,
                 "failed_count": len(failed_pods),

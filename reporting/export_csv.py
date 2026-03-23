@@ -77,6 +77,7 @@ TIMESERIES_COLUMNS = [
 ]
 
 STEP_KPIS_COLUMNS = [
+    "workflow_type",
     "step_name",
     "total_executions",
     "failed_count",

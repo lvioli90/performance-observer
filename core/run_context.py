@@ -229,6 +229,29 @@ class RunContext:
 
     def add_or_update_workflow(self, record: WorkflowRecord) -> None:
         with self._lock:
+            existing = self.workflows.get(record.workflow_name)
+            if existing is not None:
+                # Pod-based reconstruction re-derives timestamps from whatever pods
+                # are still visible.  Due to podGC (OnPodSuccess + 30s delay), early
+                # workflow pods are deleted before the workflow reaches terminal state,
+                # leaving only exit-handler pods in the final poll.  Preserve the
+                # earliest timestamps captured in any previous poll so the final
+                # overwrite cannot corrupt created_at / started_at.
+                if existing.created_at and (
+                    record.created_at is None or record.created_at > existing.created_at
+                ):
+                    record.created_at = existing.created_at
+                if existing.started_at and (
+                    record.started_at is None or record.started_at > existing.started_at
+                ):
+                    record.started_at = existing.started_at
+                # Preserve correlation fields populated by earlier polls.
+                if not record.uid and existing.uid:
+                    record.uid = existing.uid
+                if not record.product_id and existing.product_id:
+                    record.product_id = existing.product_id
+                if not record.object_key and existing.object_key:
+                    record.object_key = existing.object_key
             self.workflows[record.workflow_name] = record
             self._workflows_dirty.append(record.workflow_name)
 
