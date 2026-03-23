@@ -76,6 +76,29 @@ _MEMORY_RE = re.compile(r"^(\d+(?:\.\d+)?)(Ki|Mi|Gi|Ti|K|M|G|T)?$")
 # Hash may be purely numeric (FNV, e.g. "3279871329") or alphanumeric base32
 # (e.g. "fnk7l", "a3b7cd9e"). Match both: 5-15 lowercase alphanumeric chars.
 _ARGO_POD_HASH_RE = re.compile(r"-[a-z0-9]{5,15}$")
+# Argo node names have the form:
+#   {workflow-name}[{index}][{index}].{step-name}   (steps / DAG nodes)
+#   {workflow-name}                                  (root entrypoint)
+# Extract the terminal step name after the last dot.
+_ARGO_NODE_STEP_RE = re.compile(r"\.([^.\[\]]+)$")
+
+
+def _step_from_node_name(node_name: str) -> Optional[str]:
+    """
+    Extract the terminal step name from an Argo node-name label value.
+
+    When a step uses ``templateRef``, Argo sets
+    ``workflows.argoproj.io/workflow-step-name`` to the *external* template's
+    name (e.g. ``main``) rather than the calling step name
+    (e.g. ``send-message-success``).  The node-name label
+    (``workflows.argoproj.io/workflow-node-name``) always carries the full
+    path, e.g. ``ingestion-dispatcher-abc123[2][0].send-message-success``,
+    from which we can recover the true step name.
+
+    Returns None when the node name has no dot (root entrypoint node).
+    """
+    m = _ARGO_NODE_STEP_RE.search(node_name)
+    return m.group(1) if m else None
 
 
 def _parse_memory_mib(value: str) -> Optional[float]:
@@ -237,7 +260,16 @@ class K8sCollector:
 
         labels = meta.labels or {}
         workflow_name = labels.get(LABEL_WORKFLOW, "")
-        step_name = labels.get(LABEL_STEP) or labels.get(LABEL_STEP_V2)
+
+        # Prefer the node-name label: it always reflects the calling step name
+        # even for templateRef steps (where workflow-step-name is the external
+        # template's name, not the step name in the parent workflow).
+        node_name = labels.get(LABEL_STEP_V2)
+        step_name = (
+            _step_from_node_name(node_name)
+            if node_name
+            else None
+        ) or labels.get(LABEL_STEP)
 
         # Fallback: derive step_name from pod_name when labels are absent.
         # Argo names pods as {workflow-name}-{step-name}-{numeric-hash}, e.g.
