@@ -264,10 +264,10 @@ class K8sCollector:
         # Prefer the node-name label: it always reflects the calling step name
         # even for templateRef steps (where workflow-step-name is the external
         # template's name, not the step name in the parent workflow).
-        node_name = labels.get(LABEL_STEP_V2)
+        node_name_label = labels.get(LABEL_STEP_V2)
         step_name = (
-            _step_from_node_name(node_name)
-            if node_name
+            _step_from_node_name(node_name_label)
+            if node_name_label
             else None
         ) or labels.get(LABEL_STEP)
 
@@ -292,8 +292,27 @@ class K8sCollector:
         # Pod phase
         phase = (status.phase or "Unknown") if status else "Unknown"
 
+        # Node where the pod was scheduled (spec.node_name, available once bound)
+        k8s_node_name: Optional[str] = None
+        if pod.spec and pod.spec.node_name:
+            k8s_node_name = pod.spec.node_name
+
         # Timestamps
         created_at = _parse_iso(meta.creation_timestamp)
+
+        # pod_scheduled_at = status.start_time: set by kubelet when it first
+        # acknowledges the pod.  Equivalent to POD_START in save_pods.sh.
+        scheduled_at: Optional[datetime] = None
+        if status and status.start_time:
+            scheduled_at = _parse_iso(status.start_time)
+
+        # init_done_at = finished_at of the last init container.
+        # Equivalent to INIT_DONE in save_pods.sh.
+        init_done_at: Optional[datetime] = None
+        if status and status.init_container_statuses:
+            last_init = status.init_container_statuses[-1]
+            if last_init.state and last_init.state.terminated and last_init.state.terminated.finished_at:
+                init_done_at = _parse_iso(last_init.state.terminated.finished_at)
 
         started_at: Optional[datetime] = None
         finished_at: Optional[datetime] = None
@@ -318,8 +337,8 @@ class K8sCollector:
                         oom_killed = True
 
             # Fall back to pod start_time if container start not available
-            if started_at is None and status.start_time:
-                started_at = _parse_iso(status.start_time)
+            if started_at is None and scheduled_at is not None:
+                started_at = scheduled_at
 
         # Check last state for OOM (e.g. after a restart)
         if not oom_killed and status and status.container_statuses:
@@ -334,7 +353,10 @@ class K8sCollector:
             pod_name=pod_name,
             step_name=step_name,
             pod_phase=phase,
+            node_name=k8s_node_name,
             pod_created_at=created_at,
+            pod_scheduled_at=scheduled_at,
+            init_done_at=init_done_at,
             pod_started_at=started_at,
             pod_finished_at=finished_at,
             restart_count=restart_count,
@@ -344,6 +366,10 @@ class K8sCollector:
         # Compute derived durations
         if created_at and started_at:
             record.pod_pending_sec = (started_at - created_at).total_seconds()
+        if created_at and scheduled_at:
+            record.scheduling_sec = (scheduled_at - created_at).total_seconds()
+        if scheduled_at and init_done_at:
+            record.init_duration_sec = (init_done_at - scheduled_at).total_seconds()
         if started_at and finished_at:
             record.pod_running_sec = (finished_at - started_at).total_seconds()
 

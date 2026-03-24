@@ -78,14 +78,21 @@ class PodRecord:
     # Kubernetes pod phase: Pending | Running | Succeeded | Failed | Unknown
     pod_phase: str = "Unknown"
 
+    # Node where the pod was scheduled
+    node_name: Optional[str] = None
+
     # Timestamps
     pod_created_at: Optional[datetime] = None
-    pod_started_at: Optional[datetime] = None   # containerStatuses[0].state.running.startedAt
-    pod_finished_at: Optional[datetime] = None  # containerStatuses[0].state.terminated.finishedAt
+    pod_scheduled_at: Optional[datetime] = None  # status.start_time: kubelet acknowledged (≈ POD_START in save_pods.sh)
+    init_done_at: Optional[datetime] = None      # last init container terminated.finished_at (≈ INIT_DONE)
+    pod_started_at: Optional[datetime] = None    # containerStatuses[0].state.running.startedAt (≈ MAIN_START)
+    pod_finished_at: Optional[datetime] = None   # containerStatuses[0].state.terminated.finishedAt (≈ MAIN_END)
 
     # Derived durations (seconds)
-    pod_pending_sec: Optional[float] = None     # started_at - created_at
-    pod_running_sec: Optional[float] = None     # finished_at - started_at
+    pod_pending_sec: Optional[float] = None     # pod_started_at - pod_created_at (total pre-execution: scheduling + init)
+    scheduling_sec: Optional[float] = None      # pod_scheduled_at - pod_created_at (K8s scheduling overhead)
+    init_duration_sec: Optional[float] = None   # init_done_at - pod_scheduled_at (init container execution)
+    pod_running_sec: Optional[float] = None     # pod_finished_at - pod_started_at (main container execution)
 
     # Reliability counters
     retries: int = 0

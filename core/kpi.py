@@ -116,6 +116,8 @@ def compute_product_derived(p: dict) -> dict:
 def compute_pod_derived(pod: dict) -> dict:
     """Compute derived seconds fields for a pod record dict (in-place)."""
     pod["pod_pending_sec"] = _delta_sec(pod.get("pod_created_at"), pod.get("pod_started_at"))
+    pod["scheduling_sec"] = _delta_sec(pod.get("pod_created_at"), pod.get("pod_scheduled_at"))
+    pod["init_duration_sec"] = _delta_sec(pod.get("pod_scheduled_at"), pod.get("init_done_at"))
     pod["pod_running_sec"] = _delta_sec(pod.get("pod_started_at"), pod.get("pod_finished_at"))
     return pod
 
@@ -413,6 +415,8 @@ class KPIEngine:
             oom_pods = [p for p in step_pods if p.get("oom_killed")]
 
             pending_vals = [p["pod_pending_sec"] for p in step_pods if p.get("pod_pending_sec") is not None]
+            scheduling_vals = [p["scheduling_sec"] for p in step_pods if p.get("scheduling_sec") is not None]
+            init_vals = [p["init_duration_sec"] for p in step_pods if p.get("init_duration_sec") is not None]
             running_vals = [p["pod_running_sec"] for p in step_pods if p.get("pod_running_sec") is not None]
             # Wall-clock = pending + running: matches Argo UI node duration and
             # represents the step's true contribution to pipeline latency.
@@ -437,14 +441,21 @@ class KPIEngine:
                 "retry_rate": len(retry_pods) / total if total > 0 else None,
                 "oom_count": len(oom_pods),
                 "oom_rate": len(oom_pods) / total if total > 0 else None,
-                # Pending (scheduling delay, PVC mount, image pull)
+                # Pending (total pre-execution: scheduling + init)
                 "pending_avg": _safe_mean(pending_vals),
                 "pending_p95": _percentile(pending_vals, 95),
+                # Scheduling (K8s scheduling overhead: creation → kubelet acknowledged)
+                "scheduling_avg": _safe_mean(scheduling_vals),
+                "scheduling_p95": _percentile(scheduling_vals, 95),
+                # Init container duration (kubelet acknowledged → last init done)
+                "init_duration_avg": _safe_mean(init_vals),
+                "init_duration_p50": _percentile(init_vals, 50),
+                "init_duration_p95": _percentile(init_vals, 95),
                 # Duration = full pod lifecycle (pending + running) — matches Argo UI
                 "duration_avg": _safe_mean(wall_vals),
                 "duration_p50": _percentile(wall_vals, 50),
                 "duration_p95": _percentile(wall_vals, 95),
-                # Running = container execution only (excludes scheduling/mount time)
+                # Running = main container execution only
                 "running_avg": _safe_mean(running_vals),
                 "running_p50": _percentile(running_vals, 50),
                 "running_p95": _percentile(running_vals, 95),
@@ -548,6 +559,18 @@ class KPIEngine:
                     f"duration_p95={step['duration_p95']:.0f}s but "
                     f"cpu_peak_max={step['cpu_peak_max']:.0f}m (low). "
                     "Likely waiting on MinIO, STAC API, or another external service."
+                )
+
+        # CASE F: slow init containers (image pull, secret injection, sidecar init)
+        # Threshold: init p95 > 15s is abnormal (healthy pods init in <5s).
+        for step in steps:
+            if step.get("init_duration_p95") is not None and step["init_duration_p95"] > 15:
+                hints.append(
+                    f"CASE F (slow init container): step '{step['step_name']}' "
+                    f"init_duration_p95={step['init_duration_p95']:.0f}s. "
+                    "Likely causes: image pull on cold node, slow secret/configmap injection, "
+                    "or heavyweight sidecar init. "
+                    "Consider pre-pulling images, caching credentials, or splitting init logic."
                 )
 
         # Throughput target check (15,000/day = 625/hour = ~10.4/min)
