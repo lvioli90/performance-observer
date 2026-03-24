@@ -72,6 +72,10 @@ LABEL_STEP = "workflows.argoproj.io/workflow-step-name"   # Argo v3+
 LABEL_STEP_V2 = "workflows.argoproj.io/workflow-node-name"  # alternative label in some builds
 
 _MEMORY_RE = re.compile(r"^(\d+(?:\.\d+)?)(Ki|Mi|Gi|Ti|K|M|G|T)?$")
+# Parses Go-style duration embedded in K8s event messages, e.g.:
+#   "Successfully pulled image ... in 109ms"
+#   "Successfully pulled image ... in 1.234s"
+_PULL_DUR_RE = re.compile(r"\bin\s+(\d+(?:\.\d+)?)(ms|s)\b")
 # Argo names pods as {workflow-name}-{step-name}-{hash}
 # Hash may be purely numeric (FNV, e.g. "3279871329") or alphanumeric base32
 # (e.g. "fnk7l", "a3b7cd9e"). Match both: 5-15 lowercase alphanumeric chars.
@@ -158,6 +162,9 @@ class K8sCollector:
         self._metrics_history: Dict[str, List[tuple]] = {}
         self._k8s_client = None
         self._metrics_client = None
+        # Tracks pods whose K8s Events have already been fetched so we don't
+        # repeat the call on subsequent poll cycles.
+        self._events_fetched: set = set()
 
     # ------------------------------------------------------------------
     # Kubernetes client init (lazy, so we can run without K8s in tests)
@@ -211,6 +218,16 @@ class K8sCollector:
                         record = self._parse_pod(raw_pod)
                         if record is None:
                             continue
+                        # Enrich with K8s Events once the init phase is complete.
+                        # init_done_at being set means all init containers have
+                        # finished and the relevant events (FailedAttachVolume,
+                        # SuccessfulAttachVolume, Pulling, Pulled) are stable.
+                        if (
+                            record.pod_name not in self._events_fetched
+                            and record.init_done_at is not None
+                        ):
+                            self._enrich_pod_events(record, ns)
+                            self._events_fetched.add(record.pod_name)
                         # Apply workflow type filter: keep only dispatcher and omnipass pods
                         if record.workflow_name:
                             wn = record.workflow_name.lower()
@@ -248,6 +265,130 @@ class K8sCollector:
             timeout_seconds=30,
         )
         return result.items or []
+
+    def _fetch_pod_events(self, namespace: str, pod_name: str) -> List[Any]:
+        """
+        Return K8s Event objects for *pod_name* in *namespace*.
+
+        Uses field selectors so only events for the specific pod are returned.
+        Returns an empty list on any error (events are best-effort).
+        """
+        try:
+            result = self._k8s_client.list_namespaced_event(
+                namespace=namespace,
+                field_selector=(
+                    f"involvedObject.name={pod_name},"
+                    "involvedObject.kind=Pod"
+                ),
+                timeout_seconds=10,
+            )
+            return result.items or []
+        except Exception as exc:
+            logger.debug("Event fetch skipped for pod %s: %s", pod_name, exc)
+            return []
+
+    def _parse_pod_events(
+        self,
+        events: List[Any],
+        pod_scheduled_at: Optional[datetime],
+    ) -> tuple:
+        """
+        Extract storage and image-pull timings from a pod's Event objects.
+
+        Returns ``(volume_attach_sec, image_pull_sec, failed_attach_count)``.
+
+        volume_attach_sec
+            Time (s) from the first ``FailedAttachVolume`` event to the
+            ``SuccessfulAttachVolume`` event.  Falls back to the interval
+            between *pod_scheduled_at* and ``SuccessfulAttachVolume`` when no
+            failure was recorded (clean / fast attach).  ``None`` when no
+            ``SuccessfulAttachVolume`` event is present.
+
+        image_pull_sec
+            Sum of all image pull durations parsed from ``Pulled`` event
+            messages (Go-style "in 109ms" / "in 1.234s" suffix).  Reflects
+            only network-download time; cached images typically report < 5 ms.
+            ``None`` when no ``Pulled`` events with a parseable duration exist.
+
+        failed_attach_count
+            Total repetitions of ``FailedAttachVolume`` events (``count``
+            field summed).  0 means the volume attached on the first attempt.
+        """
+
+        def _event_ts(ev) -> Optional[datetime]:
+            # Prefer last_timestamp (updated on each repetition), then
+            # event_time (MicroTime, newer API), then first_timestamp.
+            for attr in ("last_timestamp", "event_time", "first_timestamp"):
+                val = getattr(ev, attr, None)
+                if val is not None:
+                    return _parse_iso(val)
+            return None
+
+        def _first_ts(ev) -> Optional[datetime]:
+            for attr in ("first_timestamp", "event_time", "last_timestamp"):
+                val = getattr(ev, attr, None)
+                if val is not None:
+                    return _parse_iso(val)
+            return None
+
+        failed_attach_first: Optional[datetime] = None
+        successful_attach_ts: Optional[datetime] = None
+        failed_attach_count = 0
+        total_pull_sec = 0.0
+        has_pull_data = False
+
+        for ev in events:
+            reason = getattr(ev, "reason", "") or ""
+
+            if reason == "FailedAttachVolume":
+                count = getattr(ev, "count", 1) or 1
+                failed_attach_count += count
+                ft = _first_ts(ev)
+                if ft and (failed_attach_first is None or ft < failed_attach_first):
+                    failed_attach_first = ft
+
+            elif reason == "SuccessfulAttachVolume":
+                successful_attach_ts = _event_ts(ev)
+
+            elif reason == "Pulled":
+                msg = getattr(ev, "message", "") or ""
+                m = _PULL_DUR_RE.search(msg)
+                if m:
+                    val = float(m.group(1))
+                    dur = val / 1000 if m.group(2) == "ms" else val
+                    total_pull_sec += dur
+                    has_pull_data = True
+
+        # Compute volume_attach_sec
+        volume_attach_sec: Optional[float] = None
+        if successful_attach_ts is not None:
+            ref = failed_attach_first if failed_attach_first is not None else pod_scheduled_at
+            if ref is not None:
+                diff = (successful_attach_ts - ref).total_seconds()
+                if diff >= 0:
+                    volume_attach_sec = diff
+
+        image_pull_sec: Optional[float] = total_pull_sec if has_pull_data else None
+
+        return volume_attach_sec, image_pull_sec, failed_attach_count
+
+    def _enrich_pod_events(self, record: "PodRecord", namespace: str) -> None:
+        """
+        Fetch K8s Events for *record* and populate the event-based fields.
+
+        Called once per pod after the init phase has completed
+        (``init_done_at`` is set), so events for volume attachment and image
+        pulls are already emitted and stable.
+        """
+        events = self._fetch_pod_events(namespace, record.pod_name)
+        if not events:
+            return
+        vol_sec, pull_sec, fail_count = self._parse_pod_events(
+            events, record.pod_scheduled_at
+        )
+        record.volume_attach_sec = vol_sec
+        record.image_pull_sec = pull_sec
+        record.failed_attach_count = fail_count
 
     def _parse_pod(self, pod: Any) -> Optional[PodRecord]:
         """Parse a V1Pod object into a PodRecord."""

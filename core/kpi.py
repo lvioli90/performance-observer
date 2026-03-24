@@ -430,6 +430,10 @@ class KPIEngine:
             mem_avg_vals = [p["mem_avg"] for p in step_pods if p.get("mem_avg") is not None]
             mem_peak_vals = [p["mem_peak"] for p in step_pods if p.get("mem_peak") is not None]
             throttle_vals = [p["cpu_throttling"] for p in step_pods if p.get("cpu_throttling") is not None]
+            # Event-based storage metrics (present only when K8s Events were fetched)
+            vol_attach_vals = [p["volume_attach_sec"] for p in step_pods if p.get("volume_attach_sec") is not None]
+            image_pull_vals = [p["image_pull_sec"] for p in step_pods if p.get("image_pull_sec") is not None]
+            failed_attach_total = sum(p.get("failed_attach_count") or 0 for p in step_pods)
 
             results.append({
                 "workflow_type": wf_type,
@@ -473,6 +477,11 @@ class KPIEngine:
                     sum(1 for v in throttle_vals if v > 0.1) / len(throttle_vals)
                     if throttle_vals else None
                 ),
+                # Event-based storage metrics (None when K8s Events unavailable)
+                "volume_attach_p50": _percentile(vol_attach_vals, 50),
+                "volume_attach_p95": _percentile(vol_attach_vals, 95),
+                "image_pull_p95": _percentile(image_pull_vals, 95),
+                "failed_attach_total": failed_attach_total,
             })
 
         return results
@@ -576,27 +585,70 @@ class KPIEngine:
                 continue
             init_p50 = step.get("init_duration_p50") or 0.0
             p50_str = f", p50={init_p50:.0f}s" if init_p50 else ""
-            if init_p50 > 8:
-                # Consistent across all pods → structural, not cold-start
+
+            # Evidence-based breakdown when K8s Events were collected
+            vol_p95 = step.get("volume_attach_p95")
+            pull_p95 = step.get("image_pull_p95")
+            fail_total = step.get("failed_attach_total") or 0
+
+            if vol_p95 is not None or pull_p95 is not None:
+                # Measured values available: report them and derive dominant factor
+                measured_parts = []
+                if vol_p95 is not None:
+                    measured_parts.append(f"volume_attach_p95={vol_p95:.1f}s")
+                if pull_p95 is not None:
+                    measured_parts.append(f"image_pull_p95={pull_p95:.3f}s")
+                measured_str = ", ".join(measured_parts)
+                fail_str = (
+                    f" ({fail_total} FailedAttachVolume event(s) recorded)"
+                    if fail_total > 0 else " (volume attached cleanly on first attempt)"
+                )
+                if vol_p95 is not None and pull_p95 is not None and init_p95 > 0:
+                    vol_pct = int(vol_p95 / init_p95 * 100)
+                    pull_pct = int(pull_p95 / init_p95 * 100)
+                    dominant = (
+                        f"volume attach ({vol_pct}%)" if vol_pct >= pull_pct
+                        else f"image pull ({pull_pct}%)"
+                    )
+                    breakdown = (
+                        f"Dominant factor: {dominant} of init time. "
+                        f"volume_attach={vol_pct}% image_pull={pull_pct}% "
+                        f"other={max(0, 100 - vol_pct - pull_pct)}%."
+                    )
+                else:
+                    breakdown = ""
                 cause = (
-                    "Primary suspect: Longhorn volume/share-manager not ready at pod start. "
-                    "init_duration_sec spans pod_scheduled_at → last init container done, "
-                    "which includes the CSI NodeStageVolume + NodePublishVolume calls. "
-                    "For per-workflow PVCs (PVC name contains workflow ID), Longhorn must "
-                    "start a new share-manager pod (NFS server) on each workflow run — "
-                    "typically 20-35s. Even on subsequent steps the NFS re-mount can take "
-                    "10-25s if the previous pod's unmount has not fully propagated. "
-                    "Check 'kubectl describe pod <step-pod>' for FailedAttachVolume events "
-                    "and inspect share-manager pod startup in the longhorn-system namespace."
+                    f"Measured from K8s Events: {measured_str}{fail_str}. "
+                    f"{breakdown} "
+                    "For Longhorn RWX volumes the attach window covers CSI "
+                    "NodeStageVolume + NodePublishVolume and, for per-workflow PVCs, "
+                    "the share-manager pod (NFS server) startup."
                 )
                 fix = (
-                    "Recommended: pre-provision the working-dir PVC outside the workflow "
-                    "and pass it to Calrissian as a pre-existing claim, so the Longhorn "
-                    "share-manager is already running when the workflow starts. "
+                    "Pre-provision the working-dir PVC outside the workflow so the "
+                    "Longhorn share-manager is already running when the workflow starts "
+                    "(pass it via Calrissian --persistent-volume-claim). "
+                    "Also verify Longhorn replica locality: a local replica eliminates "
+                    "the remote NFS round-trip."
+                )
+            elif init_p50 > 8:
+                # No event data — fall back to statistical heuristic (structural delay)
+                cause = (
+                    "Primary suspect: Longhorn volume/share-manager not ready at pod start "
+                    "(heuristic: p50 > 8s implies every-pod delay, not a cold-start spike). "
+                    "init_duration_sec spans pod_scheduled_at → last init container done, "
+                    "including CSI NodeStageVolume + NodePublishVolume. "
+                    "For per-workflow PVCs the share-manager must start from scratch on "
+                    "each workflow run (typically 20-35s). "
+                    "Run with K8s Events enabled to get precise attach/pull breakdown."
+                )
+                fix = (
+                    "Pre-provision the working-dir PVC outside the workflow and pass it "
+                    "to Calrissian as a pre-existing claim. "
                     "If per-workflow PVCs are required, add a lightweight warmup step "
                     "before the first CWL step to force early volume attachment. "
-                    "Also check Longhorn replica placement: co-locating the replica "
-                    "on the same node as the worker pods eliminates remote NFS overhead."
+                    "Check Longhorn replica placement: co-locating the replica on the "
+                    "same node as the worker pods eliminates remote NFS overhead."
                 )
             else:
                 # Occasional spikes → cold-start image pull

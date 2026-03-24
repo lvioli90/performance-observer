@@ -99,6 +99,15 @@ class PodRecord:
     restart_count: int = 0
     oom_killed: bool = False
 
+    # Event-based storage metrics (populated from K8s Events API when available).
+    # volume_attach_sec: time from first FailedAttachVolume → SuccessfulAttachVolume;
+    #   falls back to pod_scheduled_at → SuccessfulAttachVolume for clean attaches.
+    # image_pull_sec: total image pull duration, summed from Pulled event messages.
+    # failed_attach_count: repetitions of FailedAttachVolume (0 = volume attached cleanly).
+    volume_attach_sec: Optional[float] = None
+    image_pull_sec: Optional[float] = None
+    failed_attach_count: int = 0
+
     # Resource metrics (populated by k8s.py metrics collection)
     # CPU in milli-cores (m), memory in MiB
     cpu_avg: Optional[float] = None
