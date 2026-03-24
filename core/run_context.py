@@ -257,6 +257,16 @@ class RunContext:
 
     def add_or_update_pod(self, record: PodRecord) -> None:
         with self._lock:
+            # Inherit product_id from the correlated workflow (set by correlator.py)
+            if not record.product_id and record.workflow_name:
+                wf = self.workflows.get(record.workflow_name)
+                if wf and wf.product_id:
+                    record.product_id = wf.product_id
+            # Preserve product_id from a previous observation of this pod in case
+            # the workflow wasn't yet correlated when the pod was first seen
+            existing = self.pods.get(record.pod_name)
+            if existing and existing.product_id and not record.product_id:
+                record.product_id = existing.product_id
             self.pods[record.pod_name] = record
             self._pods_dirty.append(record.pod_name)
 

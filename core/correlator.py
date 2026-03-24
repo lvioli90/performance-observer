@@ -621,8 +621,15 @@ class Correlator:
         record.workflow_name = wf.workflow_name
         record.workflow_created_at = wf.created_at
         record.workflow_started_at = wf.started_at
-        record.workflow_finished_at = wf.finished_at
-        record.final_status = _phase_to_status(wf.phase)
+        # Never clear a finish timestamp once observed: Argo can briefly oscillate
+        # between Succeeded and Running between steps, causing wf.finished_at to
+        # temporarily become None.
+        if wf.finished_at and record.workflow_finished_at is None:
+            record.workflow_finished_at = wf.finished_at
+        # Never downgrade from succeeded: STAC confirmation or a prior Succeeded
+        # phase must not be overwritten by a transient Running phase.
+        if record.final_status != "succeeded":
+            record.final_status = _phase_to_status(wf.phase)
 
         # If dispatcher didn't provide ingest_reference_time, fall back to
         # omnipass created_at (slightly less accurate but still useful).
