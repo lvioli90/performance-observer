@@ -579,17 +579,24 @@ class KPIEngine:
             if init_p50 > 8:
                 # Consistent across all pods → structural, not cold-start
                 cause = (
-                    "Primary suspect: PVC/volume attachment delay. "
-                    "init_duration includes the time from pod scheduled to init done, "
-                    "which on sequential steps requires Longhorn to detach the PVC "
-                    "from the previous pod before the next can start. "
-                    "Check 'kubectl describe pod <step-pod>' for FailedAttachVolume events."
+                    "Primary suspect: Longhorn volume/share-manager not ready at pod start. "
+                    "init_duration_sec spans pod_scheduled_at → last init container done, "
+                    "which includes the CSI NodeStageVolume + NodePublishVolume calls. "
+                    "For per-workflow PVCs (PVC name contains workflow ID), Longhorn must "
+                    "start a new share-manager pod (NFS server) on each workflow run — "
+                    "typically 20-35s. Even on subsequent steps the NFS re-mount can take "
+                    "10-25s if the previous pod's unmount has not fully propagated. "
+                    "Check 'kubectl describe pod <step-pod>' for FailedAttachVolume events "
+                    "and inspect share-manager pod startup in the longhorn-system namespace."
                 )
                 fix = (
-                    "Consider switching the shared working-dir PVC to ReadWriteMany (RWX) "
-                    "so Longhorn can attach to multiple nodes concurrently, or tune "
-                    "Longhorn attachmentRecoveryPolicy/concurrentReplicaRebuildPerNodeLimit. "
-                    "Also verify argoexec image is pre-cached on all worker nodes."
+                    "Recommended: pre-provision the working-dir PVC outside the workflow "
+                    "and pass it to Calrissian as a pre-existing claim, so the Longhorn "
+                    "share-manager is already running when the workflow starts. "
+                    "If per-workflow PVCs are required, add a lightweight warmup step "
+                    "before the first CWL step to force early volume attachment. "
+                    "Also check Longhorn replica placement: co-locating the replica "
+                    "on the same node as the worker pods eliminates remote NFS overhead."
                 )
             else:
                 # Occasional spikes → cold-start image pull
