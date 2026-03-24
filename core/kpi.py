@@ -561,17 +561,83 @@ class KPIEngine:
                     "Likely waiting on MinIO, STAC API, or another external service."
                 )
 
-        # CASE F: slow init containers (image pull, secret injection, sidecar init)
-        # Threshold: init p95 > 15s is abnormal (healthy pods init in <5s).
+        # CASE F: slow init containers.
+        # init_duration_sec = pod_scheduled_at → last init container done.
+        # This window encompasses: PVC/volume attachment (Longhorn CSI) +
+        # image pull + init container execution.  Healthy pods init in <5s.
+        # Threshold: p95 > 15s is abnormal.
+        #
+        # Sub-classification via p50:
+        #   p50 > 8s  → structural / every-pod delay → volume attachment most likely
+        #   p50 ≤ 8s  → occasional spikes           → cold image pull most likely
         for step in steps:
-            if step.get("init_duration_p95") is not None and step["init_duration_p95"] > 15:
-                hints.append(
-                    f"CASE F (slow init container): step '{step['step_name']}' "
-                    f"init_duration_p95={step['init_duration_p95']:.0f}s. "
-                    "Likely causes: image pull on cold node, slow secret/configmap injection, "
-                    "or heavyweight sidecar init. "
-                    "Consider pre-pulling images, caching credentials, or splitting init logic."
+            init_p95 = step.get("init_duration_p95")
+            if init_p95 is None or init_p95 <= 15:
+                continue
+            init_p50 = step.get("init_duration_p50") or 0.0
+            p50_str = f", p50={init_p50:.0f}s" if init_p50 else ""
+            if init_p50 > 8:
+                # Consistent across all pods → structural, not cold-start
+                cause = (
+                    "Primary suspect: PVC/volume attachment delay. "
+                    "init_duration includes the time from pod scheduled to init done, "
+                    "which on sequential steps requires Longhorn to detach the PVC "
+                    "from the previous pod before the next can start. "
+                    "Check 'kubectl describe pod <step-pod>' for FailedAttachVolume events."
                 )
+                fix = (
+                    "Consider switching the shared working-dir PVC to ReadWriteMany (RWX) "
+                    "so Longhorn can attach to multiple nodes concurrently, or tune "
+                    "Longhorn attachmentRecoveryPolicy/concurrentReplicaRebuildPerNodeLimit. "
+                    "Also verify argoexec image is pre-cached on all worker nodes."
+                )
+            else:
+                # Occasional spikes → cold-start image pull
+                cause = (
+                    "Primary suspect: image pull on cold node (argoexec or step image "
+                    "not yet cached). Secondary causes: slow secret/configmap injection "
+                    "or PVC attachment delay."
+                )
+                fix = (
+                    "Pre-pull argoexec and step images via a DaemonSet image-prepuller. "
+                    "Cache credentials or split heavyweight init logic."
+                )
+            hints.append(
+                f"CASE F (slow init container): step '{step['step_name']}' "
+                f"init_duration_p95={init_p95:.0f}s{p50_str}. "
+                f"{cause} {fix}"
+            )
+
+        # CASE G: init overhead dominates wall-clock time.
+        # When init_duration_p95 > 50% of duration_p95, the pod spends more time
+        # in startup overhead than in actual work.  This indicates a structural
+        # platform issue that will cap throughput regardless of workload
+        # parallelism or code optimisation.
+        overhead_steps = []
+        for step in steps:
+            init_p95 = step.get("init_duration_p95")
+            dur_p95 = step.get("duration_p95")
+            if (
+                init_p95 is not None
+                and dur_p95 is not None
+                and dur_p95 > 0
+                and init_p95 / dur_p95 > 0.5
+            ):
+                pct = int(init_p95 / dur_p95 * 100)
+                overhead_steps.append((step["step_name"], init_p95, dur_p95, pct))
+        if overhead_steps:
+            step_summary = "; ".join(
+                f"'{n}' {pct}% ({i:.0f}s init / {d:.0f}s total)"
+                for n, i, d, pct in overhead_steps
+            )
+            hints.append(
+                f"CASE G (init overhead dominates): {len(overhead_steps)} step(s) spend "
+                f">50% of wall-clock time in init: {step_summary}. "
+                "Startup overhead (volume attach + image pull + argoexec copy) "
+                "is consuming the majority of each pod's lifetime. "
+                "Resolving CASE F (PVC attachment / image caching) is the "
+                "highest-leverage action to improve end-to-end throughput."
+            )
 
         # Throughput target check (15,000/day = 625/hour = ~10.4/min)
         if biz.get("avg_throughput_per_min") is not None:
