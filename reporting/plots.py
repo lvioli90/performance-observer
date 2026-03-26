@@ -618,7 +618,24 @@ def plot_step_init_overhead(
     # ------------------------------------------------------------------ #
     rows = []
     for s in step_kpis:
-        label = f"{s.get('workflow_type', '?')}/{s['step_name']}"
+        wtype = str(s.get("workflow_type") or "unknown").lower()
+        sname = str(s.get("step_name") or "")
+
+        # Show only omnipass ingestor steps.
+        # When workflow_type classification is broken (all "unknown"), fall back
+        # to excluding the obvious dispatcher-only steps by name so the chart
+        # remains usable.
+        _DISPATCHER_ONLY = {"send-message", "send-message-success", "send-message-failure"}
+        if wtype not in ("omnipass", "unknown"):
+            continue          # keep only omnipass (and unclassified as fallback)
+        if wtype == "dispatcher":
+            continue
+        if not sname or sname == "unknown":
+            continue          # skip the unresolved-step bucket
+        if sname in _DISPATCHER_ONLY:
+            continue
+
+        label = sname          # clean label: step name only, no workflow_type prefix
         sched  = max(0.0, _safe_float(s.get("scheduling_p50"))      or 0.0)
         init   = max(0.0, _safe_float(s.get("init_duration_p50"))   or 0.0)
         run    = max(0.0, _safe_float(s.get("running_p50"))         or 0.0)

@@ -234,13 +234,18 @@ class K8sCollector:
                         ):
                             self._enrich_pod_events(record, ns)
                             self._events_fetched.add(record.pod_name)
-                        # Apply workflow type filter: keep only dispatcher and omnipass pods
+                        # Apply workflow type filter: keep only dispatcher and omnipass pods.
+                        # Also classify workflow_type here so it is written to NDJSON.
                         if record.workflow_name:
                             wn = record.workflow_name.lower()
                             dispatcher_kw = self.ctx.corr_dispatcher_template.lower()
                             omnipass_kw = self.ctx.corr_omnipass_template.lower()
                             if dispatcher_kw not in wn and omnipass_kw not in wn:
                                 continue
+                            if dispatcher_kw and dispatcher_kw in wn:
+                                record.workflow_type = "dispatcher"
+                            elif omnipass_kw and omnipass_kw in wn:
+                                record.workflow_type = "omnipass"
                         # Apply tracked_steps filter
                         if self.ctx.tracked_steps and record.step_name:
                             if not any(
@@ -378,9 +383,23 @@ class K8sCollector:
                 ),
                 timeout_seconds=10,
             )
-            return result.items or []
+            items = result.items or []
+            if items:
+                reasons = [getattr(ev, "reason", "") for ev in items]
+                logger.debug(
+                    "Events for pod %s: %d events %s",
+                    pod_name, len(items), reasons,
+                )
+            else:
+                logger.debug("Events for pod %s: 0 events returned", pod_name)
+            return items
         except Exception as exc:
-            logger.debug("Event fetch skipped for pod %s: %s", pod_name, exc)
+            logger.warning(
+                "K8s Events fetch failed for pod %s (volume_attach_sec will be "
+                "unavailable): %s. Check kubeconfig, context, and RBAC "
+                "permissions for 'list events' in namespace '%s'.",
+                pod_name, exc, namespace,
+            )
             return []
 
     def _parse_pod_events(

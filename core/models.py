@@ -116,6 +116,11 @@ class PodRecord:
     mem_avg: Optional[float] = None
     mem_peak: Optional[float] = None
 
+    # Workflow type: "dispatcher" | "omnipass" | "unknown"
+    # Set by the collector from workflow_name matching against corr_*_template
+    # config keys.  Used by KPIEngine to separate dispatcher KPIs from omnipass.
+    workflow_type: str = "unknown"
+
     # Product correlation
     product_id: Optional[str] = None
 
