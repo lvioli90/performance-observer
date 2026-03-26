@@ -212,11 +212,16 @@ def plot_e2e_latency_over_time(
     products: List[dict],
     output_dir: Path,
     window_minutes: int = 5,
+    single_product: bool = False,
 ) -> Optional[Path]:
     """
     Compute rolling p50/p95 of end_to_end_sec binned into time windows,
     then plot.
     """
+    if single_product:
+        logger.info("Skipping e2e_latency_over_time: not meaningful for a single-product run")
+        return None
+
     # Build (finished_at, end_to_end_sec) pairs
     data_points: List[Tuple[datetime, float]] = []
     for p in products:
@@ -304,31 +309,40 @@ def plot_queue_time_over_time(
 # ---------------------------------------------------------------------------
 
 def plot_step_duration_comparison(
-    step_kpis: List[dict], output_dir: Path
+    step_kpis: List[dict], output_dir: Path, single_product: bool = False
 ) -> Optional[Path]:
     """
-    Horizontal bar chart: per-step p50 and p95 duration.
+    Horizontal bar chart: per-step duration.
+    Single-product run: one bar per step labelled "Observed".
+    Multi-product run: two bars per step (p50 / p95).
     """
     if not step_kpis:
         logger.warning("No step KPI data for duration plot")
         return None
 
-    steps = [
-        f"{s.get('workflow_type', 'unknown')}/{s['step_name']}" for s in step_kpis
-    ]
-    p50s = [_safe_float(s.get("duration_p50")) or 0 for s in step_kpis]
-    p95s = [_safe_float(s.get("duration_p95")) or 0 for s in step_kpis]
-
+    steps = [s["step_name"] for s in step_kpis]
     y = np.arange(len(steps))
-    height = 0.35
 
     fig, ax = plt.subplots(figsize=(_FIG_WIDTH, max(4, len(steps) * 0.6 + 1)))
-    ax.barh(y + height / 2, p50s, height, label="p50", color=_COLOR_P50, alpha=0.85)
-    ax.barh(y - height / 2, p95s, height, label="p95", color=_COLOR_P95, alpha=0.85)
+
+    if single_product:
+        vals = [_safe_float(s.get("duration_p50")) or 0 for s in step_kpis]
+        ax.barh(y, vals, 0.55, label="Observed", color=_COLOR_P50, alpha=0.85)
+        for i, v in enumerate(vals):
+            if v >= 1:
+                ax.text(v + 0.3, i, f"{v:.0f}s", va="center", fontsize=8)
+        ax.set_title("Per-Step Duration — Single Run", fontsize=13, fontweight="bold")
+    else:
+        height = 0.35
+        p50s = [_safe_float(s.get("duration_p50")) or 0 for s in step_kpis]
+        p95s = [_safe_float(s.get("duration_p95")) or 0 for s in step_kpis]
+        ax.barh(y + height / 2, p50s, height, label="p50", color=_COLOR_P50, alpha=0.85)
+        ax.barh(y - height / 2, p95s, height, label="p95", color=_COLOR_P95, alpha=0.85)
+        ax.set_title("Per-Step Duration Comparison (p50 / p95)", fontsize=13, fontweight="bold")
+
     ax.set_yticks(y)
     ax.set_yticklabels(steps)
     ax.set_xlabel("Duration (seconds)")
-    ax.set_title("Per-Step Duration Comparison (p50 / p95)", fontsize=13, fontweight="bold")
     ax.legend()
     ax.grid(True, axis="x", alpha=0.3)
     fig.tight_layout()
@@ -344,27 +358,34 @@ def plot_step_duration_comparison(
 # Plot 7: CPU peak per step
 # ---------------------------------------------------------------------------
 
-def plot_step_cpu_peak(step_kpis: List[dict], output_dir: Path) -> Optional[Path]:
-    """Bar chart: per-step CPU peak (avg of peaks and absolute max)."""
+def plot_step_cpu_peak(
+    step_kpis: List[dict], output_dir: Path, single_product: bool = False
+) -> Optional[Path]:
+    """Bar chart: per-step CPU peak."""
     if not step_kpis:
         return None
 
-    steps = [
-        f"{s.get('workflow_type', 'unknown')}/{s['step_name']}" for s in step_kpis
-    ]
-    avg_peaks = [_safe_float(s.get("cpu_peak_avg")) or 0 for s in step_kpis]
-    max_peaks = [_safe_float(s.get("cpu_peak_max")) or 0 for s in step_kpis]
-
+    steps = [s["step_name"] for s in step_kpis]
     y = np.arange(len(steps))
-    height = 0.35
 
     fig, ax = plt.subplots(figsize=(_FIG_WIDTH, max(4, len(steps) * 0.6 + 1)))
-    ax.barh(y + height / 2, avg_peaks, height, label="Avg peak CPU", color=_COLOR_BAR, alpha=0.85)
-    ax.barh(y - height / 2, max_peaks, height, label="Max peak CPU", color=_COLOR_PEAK, alpha=0.85)
+
+    if single_product:
+        # avg_peak == max_peak for a single run; show one bar
+        peaks = [_safe_float(s.get("cpu_peak_avg")) or 0 for s in step_kpis]
+        ax.barh(y, peaks, 0.55, label="Observed CPU peak", color=_COLOR_BAR, alpha=0.85)
+        ax.set_title("Per-Step CPU Peak — Single Run", fontsize=13, fontweight="bold")
+    else:
+        height = 0.35
+        avg_peaks = [_safe_float(s.get("cpu_peak_avg")) or 0 for s in step_kpis]
+        max_peaks = [_safe_float(s.get("cpu_peak_max")) or 0 for s in step_kpis]
+        ax.barh(y + height / 2, avg_peaks, height, label="Avg peak CPU", color=_COLOR_BAR, alpha=0.85)
+        ax.barh(y - height / 2, max_peaks, height, label="Max peak CPU", color=_COLOR_PEAK, alpha=0.85)
+        ax.set_title("Per-Step CPU Peak", fontsize=13, fontweight="bold")
+
     ax.set_yticks(y)
     ax.set_yticklabels(steps)
     ax.set_xlabel("CPU (milli-cores)")
-    ax.set_title("Per-Step CPU Peak", fontsize=13, fontweight="bold")
     ax.legend()
     ax.grid(True, axis="x", alpha=0.3)
     fig.tight_layout()
@@ -380,27 +401,33 @@ def plot_step_cpu_peak(step_kpis: List[dict], output_dir: Path) -> Optional[Path
 # Plot 8: Memory peak per step
 # ---------------------------------------------------------------------------
 
-def plot_step_mem_peak(step_kpis: List[dict], output_dir: Path) -> Optional[Path]:
-    """Bar chart: per-step memory peak (avg of peaks and absolute max) in MiB."""
+def plot_step_mem_peak(
+    step_kpis: List[dict], output_dir: Path, single_product: bool = False
+) -> Optional[Path]:
+    """Bar chart: per-step memory peak in MiB."""
     if not step_kpis:
         return None
 
-    steps = [
-        f"{s.get('workflow_type', 'unknown')}/{s['step_name']}" for s in step_kpis
-    ]
-    avg_peaks = [_safe_float(s.get("mem_peak_avg")) or 0 for s in step_kpis]
-    max_peaks = [_safe_float(s.get("mem_peak_max")) or 0 for s in step_kpis]
-
+    steps = [s["step_name"] for s in step_kpis]
     y = np.arange(len(steps))
-    height = 0.35
 
     fig, ax = plt.subplots(figsize=(_FIG_WIDTH, max(4, len(steps) * 0.6 + 1)))
-    ax.barh(y + height / 2, avg_peaks, height, label="Avg peak mem", color=_COLOR_BAR, alpha=0.85)
-    ax.barh(y - height / 2, max_peaks, height, label="Max peak mem", color=_COLOR_PEAK, alpha=0.85)
+
+    if single_product:
+        peaks = [_safe_float(s.get("mem_peak_avg")) or 0 for s in step_kpis]
+        ax.barh(y, peaks, 0.55, label="Observed mem peak", color=_COLOR_BAR, alpha=0.85)
+        ax.set_title("Per-Step Memory Peak — Single Run", fontsize=13, fontweight="bold")
+    else:
+        height = 0.35
+        avg_peaks = [_safe_float(s.get("mem_peak_avg")) or 0 for s in step_kpis]
+        max_peaks = [_safe_float(s.get("mem_peak_max")) or 0 for s in step_kpis]
+        ax.barh(y + height / 2, avg_peaks, height, label="Avg peak mem", color=_COLOR_BAR, alpha=0.85)
+        ax.barh(y - height / 2, max_peaks, height, label="Max peak mem", color=_COLOR_PEAK, alpha=0.85)
+        ax.set_title("Per-Step Memory Peak", fontsize=13, fontweight="bold")
+
     ax.set_yticks(y)
     ax.set_yticklabels(steps)
     ax.set_xlabel("Memory (MiB)")
-    ax.set_title("Per-Step Memory Peak", fontsize=13, fontweight="bold")
     ax.legend()
     ax.grid(True, axis="x", alpha=0.3)
     fig.tight_layout()
@@ -417,7 +444,7 @@ def plot_step_mem_peak(step_kpis: List[dict], output_dir: Path) -> Optional[Path
 # ---------------------------------------------------------------------------
 
 def plot_stac_publish_latency_histogram(
-    products: List[dict], output_dir: Path
+    products: List[dict], output_dir: Path, single_product: bool = False
 ) -> Optional[Path]:
     """
     Histogram of stac_publish_sec (omnipass_finished → properties.updated).
@@ -427,6 +454,10 @@ def plot_stac_publish_latency_histogram(
 
     Vertical lines mark p50, p95, p99.
     """
+    if single_product:
+        logger.info("Skipping stac_publish_latency_histogram: not meaningful for a single-product run")
+        return None
+
     values = [
         _safe_float(p.get("stac_publish_sec"))
         for p in products
@@ -582,7 +613,7 @@ _OVERHEAD_THRESHOLD = 0.50      # draw a warning line at 50 % overhead
 
 
 def plot_step_init_overhead(
-    step_kpis: List[dict], output_dir: Path
+    step_kpis: List[dict], output_dir: Path, single_product: bool = False
 ) -> Optional[Path]:
     """
     Dual-panel chart showing, for each Argo step, how total p50 wall-clock
@@ -749,8 +780,12 @@ def plot_step_init_overhead(
 
     ax_abs.set_yticks(y)
     ax_abs.set_yticklabels(labels, fontsize=8)
-    ax_abs.set_xlabel("p50 duration (seconds)", fontsize=9)
-    ax_abs.set_title("Absolute duration (p50)", fontsize=10, fontweight="bold")
+    dur_label = "observed duration (seconds)" if single_product else "p50 duration (seconds)"
+    ax_abs.set_xlabel(dur_label, fontsize=9)
+    ax_abs.set_title(
+        "Absolute duration (observed)" if single_product else "Absolute duration (p50)",
+        fontsize=10, fontweight="bold",
+    )
     ax_abs.grid(True, axis="x", alpha=0.25)
     ax_abs.legend(fontsize=7, loc="lower right")
 
@@ -808,8 +843,8 @@ def plot_step_init_overhead(
     ax_pct.set_yticklabels([])       # labels already on left panel
     ax_pct.set_xlabel("Fraction of total p50 duration", fontsize=9)
     ax_pct.set_title(
-        "Overhead vs effective work (%)\n"
-        "sorted by overhead fraction — highest at top",
+        "Overhead vs effective work (%) — single run" if single_product else
+        "Overhead vs effective work (%)\nsorted by overhead fraction — highest at top",
         fontsize=10, fontweight="bold",
     )
     ax_pct.legend(fontsize=7, loc="lower right")
@@ -844,22 +879,46 @@ def generate_all_plots(
 ) -> Dict[str, Optional[Path]]:
     """
     Run all plot generators and return a dict of name -> file path.
+
+    Automatically detects single-product runs (≤ 1 completed product) and
+    adapts the plots accordingly:
+    - Percentile comparisons (p50/p95) are replaced with "Observed" single bars
+    - Rolling-window and histogram plots are skipped (not meaningful with 1 data point)
+    - Labels change from "p50 duration" to "observed duration"
     """
     plots_dir = output_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
 
+    # Detect single-product run: ≤ 1 completed product OR all steps have ≤ 1 execution
+    n_completed = sum(
+        1 for p in products
+        if str(p.get("final_status", "")).lower() in ("succeeded", "success", "completed", "1", "true")
+        or _safe_float(p.get("workflow_run_sec")) is not None
+    )
+    # Fallback: use step execution counts when product records are thin
+    max_step_executions = max(
+        (int(s.get("total_executions") or 1) for s in step_kpis), default=1
+    )
+    single = (n_completed <= 1) and (max_step_executions <= 2)
+    if single:
+        logger.info(
+            "Single-product run detected (%d completed products, max step executions=%d) "
+            "— p95 metrics omitted from plots",
+            n_completed, max_step_executions,
+        )
+
     results = {}
-    results["throughput_over_time"] = plot_throughput_over_time(timeseries, plots_dir)
-    results["workflows_pending_over_time"] = plot_workflows_pending_over_time(timeseries, plots_dir)
-    results["workflows_running_over_time"] = plot_workflows_running_over_time(timeseries, plots_dir)
-    results["e2e_latency_over_time"] = plot_e2e_latency_over_time(timeseries, products, plots_dir)
-    results["queue_time_over_time"] = plot_queue_time_over_time(timeseries, plots_dir)
-    results["step_duration_comparison"] = plot_step_duration_comparison(step_kpis, plots_dir)
-    results["step_cpu_peak"] = plot_step_cpu_peak(step_kpis, plots_dir)
-    results["step_mem_peak"] = plot_step_mem_peak(step_kpis, plots_dir)
-    results["stac_publish_latency_histogram"] = plot_stac_publish_latency_histogram(products, plots_dir)
-    results["pipeline_breakdown"] = plot_pipeline_breakdown(products, plots_dir)
-    results["step_init_overhead"] = plot_step_init_overhead(step_kpis, plots_dir)
+    results["throughput_over_time"]          = plot_throughput_over_time(timeseries, plots_dir)
+    results["workflows_pending_over_time"]   = plot_workflows_pending_over_time(timeseries, plots_dir)
+    results["workflows_running_over_time"]   = plot_workflows_running_over_time(timeseries, plots_dir)
+    results["e2e_latency_over_time"]         = plot_e2e_latency_over_time(timeseries, products, plots_dir, single_product=single)
+    results["queue_time_over_time"]          = plot_queue_time_over_time(timeseries, plots_dir)
+    results["step_duration_comparison"]      = plot_step_duration_comparison(step_kpis, plots_dir, single_product=single)
+    results["step_cpu_peak"]                 = plot_step_cpu_peak(step_kpis, plots_dir, single_product=single)
+    results["step_mem_peak"]                 = plot_step_mem_peak(step_kpis, plots_dir, single_product=single)
+    results["stac_publish_latency_histogram"]= plot_stac_publish_latency_histogram(products, plots_dir, single_product=single)
+    results["pipeline_breakdown"]            = plot_pipeline_breakdown(products, plots_dir)
+    results["step_init_overhead"]            = plot_step_init_overhead(step_kpis, plots_dir, single_product=single)
 
     generated = sum(1 for v in results.values() if v is not None)
     logger.info("Generated %d/%d plots in %s", generated, len(results), plots_dir)
