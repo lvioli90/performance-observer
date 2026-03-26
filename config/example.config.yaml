@@ -56,6 +56,18 @@ kubernetes:
   # Rancher/RKE2 UAT context as configured in the kubeconfig above.
   context: "uatmkpl"
 
+  # Label selector for CWL tool pods spawned by Calrissian.
+  # Calrissian creates one pod per CWL tool step (e.g. step-1-pod-*).
+  # These pods carry NO Argo workflow label and are normally invisible to
+  # the observer.  Set this to the label Calrissian attaches to the pods
+  # it creates (check with: kubectl get pods -n datalake --show-labels | grep step-).
+  # Workflow correlation is resolved automatically via the calrissian-wdir
+  # PVC claim name embedded in each pod's volume spec.
+  # Leave empty (default) to disable Calrissian tool-pod tracking.
+  #
+  # Example: calrissian_tool_label_selector: "app=calrissian"
+  calrissian_tool_label_selector: ""
+
 # --------------------------------------------------------
 # STAC catalog
 # --------------------------------------------------------

@@ -128,6 +128,16 @@ class RunContext:
         self.pod_namespaces: List[str] = k.get("pod_namespaces", [self.argo_namespace])
         self.kubeconfig: Optional[str] = k.get("kubeconfig") or None
         self.k8s_context: Optional[str] = k.get("context") or None
+        # Label selector for CWL tool pods spawned by Calrissian.
+        # These pods are created by the Calrissian process (not directly by Argo)
+        # and therefore do NOT carry the Argo workflow label.  Set this to the
+        # label Calrissian attaches to the pods it creates, e.g. "app=calrissian".
+        # Workflow correlation is done automatically via the calrissian-wdir PVC
+        # claim name embedded in each pod's volume spec.
+        # Leave empty to disable Calrissian tool-pod tracking.
+        self.calrissian_tool_label_selector: str = k.get(
+            "calrissian_tool_label_selector", ""
+        )
 
         # --- STAC config ---
         s = cfg.get("stac", {})

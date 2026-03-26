@@ -80,6 +80,12 @@ _PULL_DUR_RE = re.compile(r"\bin\s+(\d+(?:\.\d+)?)(ms|s)\b")
 # Hash may be purely numeric (FNV, e.g. "3279871329") or alphanumeric base32
 # (e.g. "fnk7l", "a3b7cd9e"). Match both: 5-15 lowercase alphanumeric chars.
 _ARGO_POD_HASH_RE = re.compile(r"-[a-z0-9]{5,15}$")
+# Calrissian tool pods are created by the Calrissian process (not Argo directly)
+# and are named "{cwl-step}-pod-{uuid8}", e.g. "step-1-pod-tonqaiuf".
+# The PVC claim name for the calrissian working directory follows the Argo
+# volumeClaimTemplates convention: "{workflow-name}-calrissian-wdir".
+_CALRISSIAN_TOOL_POD_RE = re.compile(r"^(.+?)-pod-[a-z0-9]{8}$")
+_CALRISSIAN_PVC_SUFFIX = "-calrissian-wdir"
 # Argo node names have the form:
 #   {workflow-name}[{index}][{index}].{step-name}   (steps / DAG nodes)
 #   {workflow-name}                                  (root entrypoint)
@@ -249,6 +255,42 @@ class K8sCollector:
             except Exception as exc:
                 logger.warning("Pod list failed for ns=%s: %s", ns, exc)
 
+        # ------------------------------------------------------------------
+        # Calrissian CWL tool pods (no Argo workflow label — separate loop)
+        # ------------------------------------------------------------------
+        for ns in self.ctx.pod_namespaces:
+            try:
+                cwl_pods = self._list_calrissian_tool_pods(ns)
+                for raw_pod in cwl_pods:
+                    try:
+                        record = self._parse_pod(raw_pod)
+                        if record is None:
+                            continue
+                        # Event enrichment (same rule as Argo pods)
+                        if (
+                            record.pod_name not in self._events_fetched
+                            and record.init_done_at is not None
+                        ):
+                            self._enrich_pod_events(record, ns)
+                            self._events_fetched.add(record.pod_name)
+                        # Keep only pods that were correlated to a known workflow.
+                        # Pods whose workflow_name is still None after _parse_pod()
+                        # (PVC not yet bound or PVC name not matching suffix) are
+                        # skipped to avoid polluting the store with unrelated pods.
+                        if not record.workflow_name:
+                            continue
+                        # Calrissian tool pods bypass the tracked_steps filter:
+                        # they are tracked unconditionally when the label selector
+                        # is configured.
+                        self.ctx.add_or_update_pod(record)
+                        records.append(record)
+                    except Exception as exc:
+                        logger.warning("Error parsing Calrissian tool pod: %s", exc)
+            except Exception as exc:
+                logger.warning(
+                    "Calrissian tool pod collection failed for ns=%s: %s", ns, exc
+                )
+
         logger.debug("Pod poll: %d pods observed", len(records))
         return records
 
@@ -265,6 +307,60 @@ class K8sCollector:
             timeout_seconds=30,
         )
         return result.items or []
+
+    def _list_calrissian_tool_pods(self, namespace: str) -> List[Any]:
+        """
+        Return raw V1Pod objects for CWL tool pods spawned by Calrissian.
+
+        Calrissian creates one pod per CWL tool execution (e.g. ``step-1-pod-*``).
+        These pods are NOT managed by Argo and do not carry the Argo workflow
+        label, so they are invisible to ``_list_pods()``.
+
+        Requires ``ctx.calrissian_tool_label_selector`` to be set (e.g.
+        ``"app=calrissian"``).  Returns an empty list when the selector is not
+        configured or the API call fails.
+        """
+        if not self.ctx.calrissian_tool_label_selector:
+            return []
+        try:
+            result = self._k8s_client.list_namespaced_pod(
+                namespace=namespace,
+                label_selector=self.ctx.calrissian_tool_label_selector,
+                timeout_seconds=30,
+            )
+            return result.items or []
+        except Exception as exc:
+            logger.debug(
+                "Calrissian tool pod list failed for ns=%s: %s", namespace, exc
+            )
+            return []
+
+    @staticmethod
+    def _workflow_name_from_pvc(pod: Any) -> Optional[str]:
+        """
+        Extract the Argo workflow name from the calrissian-wdir PVC claim name.
+
+        Argo ``volumeClaimTemplates`` creates PVCs named
+        ``{template-name}-{workflow-name}``.  For the calrissian working
+        directory the template name is ``calrissian-wdir``, so the PVC is
+        ``calrissian-wdir-{workflow-name}``
+
+        BUT Argo actually names them ``{workflow-name}-calrissian-wdir``
+        (workflow name first, then template name).  We match the suffix
+        ``-calrissian-wdir`` and return whatever precedes it.
+
+        Returns None when no matching volume is found.
+        """
+        if not (pod.spec and pod.spec.volumes):
+            return None
+        for vol in pod.spec.volumes:
+            pvc = getattr(vol, "persistent_volume_claim", None)
+            if pvc is None:
+                continue
+            claim = getattr(pvc, "claim_name", None) or ""
+            if claim.endswith(_CALRISSIAN_PVC_SUFFIX):
+                return claim[: -len(_CALRISSIAN_PVC_SUFFIX)] or None
+        return None
 
     def _fetch_pod_events(self, namespace: str, pod_name: str) -> List[Any]:
         """
@@ -435,6 +531,19 @@ class K8sCollector:
             job_name = labels.get("job-name", "")
             if job_name:
                 step_name = _ARGO_POD_HASH_RE.sub("", job_name) or None
+
+        # Fallback: CWL tool pods spawned directly by Calrissian (not via K8s Job).
+        # Naming convention: "{cwl-step-name}-pod-{uuid8}", e.g. "step-1-pod-tonqaiuf".
+        # These pods have no Argo labels; correlate to the workflow via the
+        # calrissian-wdir PVC claim name embedded in pod.spec.volumes.
+        if not step_name:
+            m = _CALRISSIAN_TOOL_POD_RE.match(pod_name)
+            if m:
+                step_name = m.group(1)          # e.g. "step-1"
+        if not workflow_name:
+            wf_from_pvc = self._workflow_name_from_pvc(pod)
+            if wf_from_pvc:
+                workflow_name = wf_from_pvc     # correlated via PVC claim name
 
         # Pod phase
         phase = (status.phase or "Unknown") if status else "Unknown"
