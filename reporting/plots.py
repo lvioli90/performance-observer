@@ -680,6 +680,10 @@ def plot_step_init_overhead(
     totals       = np.array([r["total"]        for r in rows])
     has_vol      = [r["vol"] is not None       for r in rows]
 
+    # vol_attach data availability drives legend / subtitle wording
+    any_vol_data = any(has_vol)
+    init_label   = "Vol attach + init-ctr" if any_vol_data else "Init overhead"
+
     n = len(rows)
     fig_h = max(4.5, n * 0.70 + 2.5)
     fig, (ax_abs, ax_pct) = plt.subplots(
@@ -732,9 +736,9 @@ def plot_step_init_overhead(
         _label_abs(ax_abs, lefts, vol_plot)
         lefts += vol_plot
 
-    # remaining init
+    # remaining init (full init_duration when vol_attach not available)
     ax_abs.barh(y, init_vals, bar_h, left=lefts,
-                label="Init (pull + init-ctr)", color=_COLOR_INIT, alpha=0.9)
+                label=init_label, color=_COLOR_INIT, alpha=0.9)
     _label_abs(ax_abs, lefts, init_vals)
     lefts += init_vals
 
@@ -811,9 +815,12 @@ def plot_step_init_overhead(
     ax_pct.legend(fontsize=7, loc="lower right")
     ax_pct.grid(True, axis="x", alpha=0.25)
 
+    if any_vol_data:
+        subtitle = "scheduling (gray) | volume attach (dark red) | init-ctr (orange) | running (green)"
+    else:
+        subtitle = "scheduling (gray) | init overhead (orange) | running (green)  —  enable K8s Events for vol-attach breakdown"
     fig.suptitle(
-        "Per-Step Init Overhead Analysis\n"
-        "scheduling (gray) | volume attach (dark red) | init-ctr (orange) | running (green)",
+        f"Per-Step Init Overhead Analysis\n{subtitle}",
         fontsize=11, fontweight="bold", y=1.01,
     )
     fig.tight_layout()
