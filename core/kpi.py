@@ -398,13 +398,16 @@ class KPIEngine:
         by_key: Dict[Tuple[str, str], List[dict]] = defaultdict(list)
         for pod in self.pods:
             step = pod.get("step_name") or "unknown"
-            wf_name = (pod.get("workflow_name") or "").lower()
-            if self.dispatcher_template and self.dispatcher_template in wf_name:
-                wf_type = "dispatcher"
-            elif self.omnipass_template and self.omnipass_template in wf_name:
-                wf_type = "omnipass"
-            else:
-                wf_type = "unknown"
+            # Prefer the workflow_type already resolved during collection (set by
+            # poll_pods); fall back to keyword-matching on workflow_name only when
+            # the stored value is absent or still "unknown".
+            wf_type = pod.get("workflow_type") or "unknown"
+            if wf_type == "unknown":
+                wf_name = (pod.get("workflow_name") or "").lower()
+                if self.dispatcher_template and self.dispatcher_template in wf_name:
+                    wf_type = "dispatcher"
+                elif self.omnipass_template and self.omnipass_template in wf_name:
+                    wf_type = "omnipass"
             by_key[(wf_type, step)].append(pod)
 
         results = []

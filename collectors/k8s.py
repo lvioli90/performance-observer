@@ -326,7 +326,28 @@ class K8sCollector:
         configured or the API call fails.
         """
         if not self.ctx.calrissian_tool_label_selector:
-            return []
+            # No label selector configured: auto-detect by pod name pattern
+            # (_CALRISSIAN_TOOL_POD_RE) AND presence of a calrissian-wdir PVC,
+            # which ties the pod back to an Argo workflow without needing labels.
+            try:
+                result = self._k8s_client.list_namespaced_pod(
+                    namespace=namespace,
+                    timeout_seconds=30,
+                )
+                return [
+                    p for p in (result.items or [])
+                    if _CALRISSIAN_TOOL_POD_RE.match(
+                        getattr(p.metadata, "name", "") or ""
+                    )
+                    and self._workflow_name_from_pvc(p) is not None
+                ]
+            except Exception as exc:
+                logger.debug(
+                    "Calrissian tool pod auto-detect failed for ns=%s: %s",
+                    namespace,
+                    exc,
+                )
+                return []
         try:
             result = self._k8s_client.list_namespaced_pod(
                 namespace=namespace,
@@ -446,6 +467,7 @@ class K8sCollector:
                     return _parse_iso(val)
             return None
 
+        scheduled_event_ts: Optional[datetime] = None  # from K8s "Scheduled" event
         failed_attach_first: Optional[datetime] = None
         successful_attach_ts: Optional[datetime] = None
         failed_attach_count = 0
@@ -455,7 +477,13 @@ class K8sCollector:
         for ev in events:
             reason = getattr(ev, "reason", "") or ""
 
-            if reason == "FailedAttachVolume":
+            if reason == "Scheduled":
+                # Use the Scheduled event as the earliest reliable reference
+                # timestamp: it fires when the pod is bound to a node, always
+                # before volume attach starts.
+                scheduled_event_ts = _first_ts(ev)
+
+            elif reason == "FailedAttachVolume":
                 count = getattr(ev, "count", 1) or 1
                 failed_attach_count += count
                 ft = _first_ts(ev)
@@ -474,16 +502,18 @@ class K8sCollector:
                     total_pull_sec += dur
                     has_pull_data = True
 
-        # Compute volume_attach_sec
-        # Always measure from pod_scheduled_at → SuccessfulAttachVolume so we
-        # capture the full wait experienced by the pod, including any "silent"
-        # pre-failure period that precedes the first FailedAttachVolume event.
-        # (Using first_failure as reference would miss up to ~20s of real wait
-        # observed in production when the CSI driver retries silently first.)
+        # Compute volume_attach_sec: Scheduled event → SuccessfulAttachVolume.
+        # The Scheduled event is the most reliable reference because it fires
+        # when the pod is bound to a node (before kubelet sets status.start_time
+        # and before any volume attach attempt begins).  Fall back chain:
+        #   1. Scheduled event timestamp  (always precedes SuccessfulAttachVolume)
+        #   2. pod_scheduled_at (status.start_time) — can be set after attach on
+        #      fast nodes; accept only when diff >= 0
+        #   3. failed_attach_first — for retried attaches with no Scheduled event
         # failed_attach_count separately signals whether the volume was contested.
         volume_attach_sec: Optional[float] = None
         if successful_attach_ts is not None:
-            ref = pod_scheduled_at if pod_scheduled_at is not None else failed_attach_first
+            ref = scheduled_event_ts or pod_scheduled_at or failed_attach_first
             if ref is not None:
                 diff = (successful_attach_ts - ref).total_seconds()
                 if diff >= 0:
