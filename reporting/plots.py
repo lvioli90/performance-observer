@@ -18,6 +18,10 @@ Plots generated
 10. pipeline_breakdown.png             - stacked bar per product showing time
                                          split: dispatcher_run + pipeline_gap +
                                          workflow_queue + workflow_run + stac_publish
+11. step_init_overhead.png             - per-step overhead vs effective running time:
+                                         scheduling | init (volume attach + image pull)
+                                         | running — shown as absolute seconds (left)
+                                         and as 100% normalised breakdown (right)
 
 All plots are saved as PNG files in the output directory.
 Matplotlib's Agg backend is used so no display is required.
@@ -567,6 +571,244 @@ def plot_pipeline_breakdown(
 
 
 # ---------------------------------------------------------------------------
+# Plot 11: Per-step init overhead vs effective running time
+# ---------------------------------------------------------------------------
+
+_COLOR_SCHEDULING = "#90A4AE"   # blue-grey  — K8s scheduling
+_COLOR_INIT       = "#FF7043"   # deep orange — init containers (vol attach + pull)
+_COLOR_VOL_ATTACH = "#B71C1C"   # dark red   — volume attach sub-component
+_COLOR_RUNNING_EFF = "#66BB6A"  # green      — main container (effective work)
+_OVERHEAD_THRESHOLD = 0.50      # draw a warning line at 50 % overhead
+
+
+def plot_step_init_overhead(
+    step_kpis: List[dict], output_dir: Path
+) -> Optional[Path]:
+    """
+    Dual-panel chart showing, for each Argo step, how total p50 wall-clock
+    time is split between scheduling overhead, init-container overhead, and
+    effective main-container execution.
+
+    Left panel  — absolute seconds (stacked bar).
+    Right panel — 100 % normalised breakdown; a vertical dashed line at 50 %
+                  separates "mostly overhead" from "mostly work".
+
+    Segments
+    --------
+    scheduling   (gray)        pod_scheduled_at − pod_created_at
+    volume_attach (dark red)   SuccessfulAttachVolume − pod_scheduled_at
+                               (only when K8s Events were collected)
+    init_rest     (orange)     remaining init time after volume attach
+                               (= init_duration_p50 − volume_attach_p50)
+    running      (green)       main container execution
+
+    When volume_attach_p50 is None the whole init bar is shown in orange
+    without sub-splitting.
+
+    Steps with no timing data at all are omitted.
+    Steps are sorted by overhead fraction (scheduling + init) / total,
+    highest overhead at the top.
+    """
+    if not step_kpis:
+        logger.warning("No step KPI data for init overhead plot")
+        return None
+
+    # ------------------------------------------------------------------ #
+    # Build per-step data                                                  #
+    # ------------------------------------------------------------------ #
+    rows = []
+    for s in step_kpis:
+        label = f"{s.get('workflow_type', '?')}/{s['step_name']}"
+        sched  = max(0.0, _safe_float(s.get("scheduling_p50"))      or 0.0)
+        init   = max(0.0, _safe_float(s.get("init_duration_p50"))   or 0.0)
+        run    = max(0.0, _safe_float(s.get("running_p50"))         or 0.0)
+        vol    = _safe_float(s.get("volume_attach_p50"))
+
+        total = sched + init + run
+        if total < 0.5:          # skip steps with no timing at all
+            continue
+
+        if vol is not None:
+            vol = max(0.0, min(vol, init))   # clamp to init window
+            init_rest = max(0.0, init - vol)
+        else:
+            vol = None
+            init_rest = init
+
+        overhead = sched + init
+        overhead_pct = overhead / total if total > 0 else 0.0
+
+        rows.append({
+            "label":        label,
+            "sched":        sched,
+            "vol":          vol,          # None when events not collected
+            "init_rest":    init_rest,
+            "run":          run,
+            "total":        total,
+            "overhead_pct": overhead_pct,
+        })
+
+    if not rows:
+        logger.warning("No step data with sufficient timing for init overhead plot")
+        return None
+
+    # Sort: highest overhead fraction at top
+    rows.sort(key=lambda r: r["overhead_pct"], reverse=True)
+
+    labels       = [r["label"]       for r in rows]
+    sched_vals   = np.array([r["sched"]        for r in rows])
+    vol_vals     = np.array([r["vol"] if r["vol"] is not None else 0.0 for r in rows])
+    init_vals    = np.array([r["init_rest"]    for r in rows])
+    run_vals     = np.array([r["run"]          for r in rows])
+    totals       = np.array([r["total"]        for r in rows])
+    has_vol      = [r["vol"] is not None       for r in rows]
+
+    n = len(rows)
+    fig_h = max(4.5, n * 0.70 + 2.5)
+    fig, (ax_abs, ax_pct) = plt.subplots(
+        1, 2,
+        figsize=(16, fig_h),
+        gridspec_kw={"width_ratios": [1, 1]},
+    )
+    y = np.arange(n)
+    bar_h = 0.55
+
+    # ------------------------------------------------------------------ #
+    # Helper: add value label inside a bar segment                         #
+    # ------------------------------------------------------------------ #
+    def _label_abs(ax, lefts, vals, fmt="{:.0f}s", min_width=2.0, **txt_kw):
+        for i, (l, v) in enumerate(zip(lefts, vals)):
+            if v >= min_width:
+                ax.text(
+                    l + v / 2, i, fmt.format(v),
+                    ha="center", va="center", fontsize=7,
+                    color="white", fontweight="bold", **txt_kw
+                )
+
+    def _label_pct(ax, lefts, vals, totals, min_pct=0.05, **txt_kw):
+        for i, (l, v, tot) in enumerate(zip(lefts, vals, totals)):
+            pct = v / tot if tot > 0 else 0
+            if pct >= min_pct:
+                ax.text(
+                    l + pct / 2, i, f"{pct:.0%}",
+                    ha="center", va="center", fontsize=7,
+                    color="white", fontweight="bold", **txt_kw
+                )
+
+    # ================================================================== #
+    # Left panel — absolute seconds                                        #
+    # ================================================================== #
+    lefts = np.zeros(n)
+
+    # scheduling
+    ax_abs.barh(y, sched_vals, bar_h, left=lefts,
+                label="Scheduling", color=_COLOR_SCHEDULING, alpha=0.9)
+    _label_abs(ax_abs, lefts, sched_vals)
+    lefts += sched_vals
+
+    # volume attach (sub-segment of init, only when events available)
+    vol_mask = np.array([1.0 if hv else 0.0 for hv in has_vol])
+    vol_plot = vol_vals * vol_mask
+    if vol_plot.sum() > 0:
+        ax_abs.barh(y, vol_plot, bar_h, left=lefts,
+                    label="Volume attach", color=_COLOR_VOL_ATTACH, alpha=0.9)
+        _label_abs(ax_abs, lefts, vol_plot)
+        lefts += vol_plot
+
+    # remaining init
+    ax_abs.barh(y, init_vals, bar_h, left=lefts,
+                label="Init (pull + init-ctr)", color=_COLOR_INIT, alpha=0.9)
+    _label_abs(ax_abs, lefts, init_vals)
+    lefts += init_vals
+
+    # running
+    ax_abs.barh(y, run_vals, bar_h, left=lefts,
+                label="Running (effective work)", color=_COLOR_RUNNING_EFF, alpha=0.9)
+    _label_abs(ax_abs, lefts, run_vals)
+
+    ax_abs.set_yticks(y)
+    ax_abs.set_yticklabels(labels, fontsize=8)
+    ax_abs.set_xlabel("p50 duration (seconds)", fontsize=9)
+    ax_abs.set_title("Absolute duration (p50)", fontsize=10, fontweight="bold")
+    ax_abs.grid(True, axis="x", alpha=0.25)
+    ax_abs.legend(fontsize=7, loc="lower right")
+
+    # ================================================================== #
+    # Right panel — 100 % normalised                                       #
+    # ================================================================== #
+    lefts_pct = np.zeros(n)
+
+    sched_pct   = np.where(totals > 0, sched_vals  / totals, 0.0)
+    vol_pct     = np.where(totals > 0, vol_plot     / totals, 0.0)
+    init_pct    = np.where(totals > 0, init_vals    / totals, 0.0)
+    run_pct     = np.where(totals > 0, run_vals     / totals, 0.0)
+
+    ax_pct.barh(y, sched_pct, bar_h, left=lefts_pct,
+                color=_COLOR_SCHEDULING, alpha=0.9)
+    _label_pct(ax_pct, lefts_pct, sched_pct, np.ones(n))
+    lefts_pct += sched_pct
+
+    if vol_pct.sum() > 0:
+        ax_pct.barh(y, vol_pct, bar_h, left=lefts_pct,
+                    color=_COLOR_VOL_ATTACH, alpha=0.9)
+        _label_pct(ax_pct, lefts_pct, vol_pct, np.ones(n))
+        lefts_pct += vol_pct
+
+    ax_pct.barh(y, init_pct, bar_h, left=lefts_pct,
+                color=_COLOR_INIT, alpha=0.9)
+    _label_pct(ax_pct, lefts_pct, init_pct, np.ones(n))
+    lefts_pct += init_pct
+
+    ax_pct.barh(y, run_pct, bar_h, left=lefts_pct,
+                color=_COLOR_RUNNING_EFF, alpha=0.9)
+    _label_pct(ax_pct, lefts_pct, run_pct, np.ones(n))
+
+    # 50 % overhead warning line
+    ax_pct.axvline(
+        _OVERHEAD_THRESHOLD, color="#E53935", linewidth=1.4, linestyle="--",
+        label=f"{_OVERHEAD_THRESHOLD:.0%} overhead threshold",
+    )
+
+    # Annotate the overhead % on the right margin
+    for i, r in enumerate(rows):
+        pct = r["overhead_pct"]
+        color = "#B71C1C" if pct > _OVERHEAD_THRESHOLD else "#2E7D32"
+        ax_pct.text(
+            1.02, i, f"{pct:.0%} overhead",
+            va="center", ha="left", fontsize=7.5,
+            color=color, fontweight="bold",
+            transform=ax_pct.get_yaxis_transform(),
+        )
+
+    ax_pct.set_xlim(0, 1)
+    ax_pct.set_xticks([0, 0.25, 0.5, 0.75, 1.0])
+    ax_pct.set_xticklabels(["0%", "25%", "50%", "75%", "100%"], fontsize=8)
+    ax_pct.set_yticks(y)
+    ax_pct.set_yticklabels([])       # labels already on left panel
+    ax_pct.set_xlabel("Fraction of total p50 duration", fontsize=9)
+    ax_pct.set_title(
+        "Overhead vs effective work (%)\n"
+        "sorted by overhead fraction — highest at top",
+        fontsize=10, fontweight="bold",
+    )
+    ax_pct.legend(fontsize=7, loc="lower right")
+    ax_pct.grid(True, axis="x", alpha=0.25)
+
+    fig.suptitle(
+        "Per-Step Init Overhead Analysis\n"
+        "scheduling (gray) | volume attach (dark red) | init-ctr (orange) | running (green)",
+        fontsize=11, fontweight="bold", y=1.01,
+    )
+    fig.tight_layout()
+
+    path = output_dir / "step_init_overhead.png"
+    fig.savefig(path, dpi=_DPI, bbox_inches="tight")
+    plt.close(fig)
+    logger.info("Saved %s", path)
+    return path
+
+
+# ---------------------------------------------------------------------------
 # Generate all plots
 # ---------------------------------------------------------------------------
 
@@ -593,6 +835,7 @@ def generate_all_plots(
     results["step_mem_peak"] = plot_step_mem_peak(step_kpis, plots_dir)
     results["stac_publish_latency_histogram"] = plot_stac_publish_latency_histogram(products, plots_dir)
     results["pipeline_breakdown"] = plot_pipeline_breakdown(products, plots_dir)
+    results["step_init_overhead"] = plot_step_init_overhead(step_kpis, plots_dir)
 
     generated = sum(1 for v in results.values() if v is not None)
     logger.info("Generated %d/%d plots in %s", generated, len(results), plots_dir)
