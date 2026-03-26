@@ -360,9 +360,15 @@ class K8sCollector:
                     has_pull_data = True
 
         # Compute volume_attach_sec
+        # Always measure from pod_scheduled_at → SuccessfulAttachVolume so we
+        # capture the full wait experienced by the pod, including any "silent"
+        # pre-failure period that precedes the first FailedAttachVolume event.
+        # (Using first_failure as reference would miss up to ~20s of real wait
+        # observed in production when the CSI driver retries silently first.)
+        # failed_attach_count separately signals whether the volume was contested.
         volume_attach_sec: Optional[float] = None
         if successful_attach_ts is not None:
-            ref = failed_attach_first if failed_attach_first is not None else pod_scheduled_at
+            ref = pod_scheduled_at if pod_scheduled_at is not None else failed_attach_first
             if ref is not None:
                 diff = (successful_attach_ts - ref).total_seconds()
                 if diff >= 0:
