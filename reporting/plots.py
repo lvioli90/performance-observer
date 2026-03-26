@@ -672,6 +672,14 @@ def plot_step_init_overhead(
         run    = max(0.0, _safe_float(s.get("running_p50"))         or 0.0)
         vol    = _safe_float(s.get("volume_attach_p50"))
 
+        # When running_p50 is unavailable (e.g. Calrissian tool pods that lack
+        # init containers and whose container timestamps aren't parsed), infer
+        # the running component from the observed wall-clock duration.
+        if run == 0.0:
+            dur = max(0.0, _safe_float(s.get("duration_p50")) or 0.0)
+            if dur > sched + init:
+                run = dur - sched - init
+
         total = sched + init + run
         if total < 0.5:          # skip steps with no timing at all
             continue

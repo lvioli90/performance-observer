@@ -284,9 +284,17 @@ class K8sCollector:
                         # skipped to avoid polluting the store with unrelated pods.
                         if not record.workflow_name:
                             continue
+                        # Classify workflow_type from the correlated workflow_name
+                        # (same logic as the Argo-pod loop above).
+                        wn = record.workflow_name.lower()
+                        dispatcher_kw = self.ctx.corr_dispatcher_template.lower()
+                        omnipass_kw   = self.ctx.corr_omnipass_template.lower()
+                        if dispatcher_kw and dispatcher_kw in wn:
+                            record.workflow_type = "dispatcher"
+                        elif omnipass_kw and omnipass_kw in wn:
+                            record.workflow_type = "omnipass"
                         # Calrissian tool pods bypass the tracked_steps filter:
-                        # they are tracked unconditionally when the label selector
-                        # is configured.
+                        # they are tracked unconditionally.
                         self.ctx.add_or_update_pod(record)
                         records.append(record)
                     except Exception as exc:
