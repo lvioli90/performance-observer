@@ -21,7 +21,6 @@ File layout
       workflows.ndjson        <- one WorkflowRecord JSON per line
       pods.ndjson             <- one PodRecord JSON per line
       products.ndjson         <- one ProductRecord JSON per line
-      stac.ndjson             <- one StacRecord JSON per line
       timeseries.ndjson       <- one TimeseriesSnapshot JSON per line
     checkpoint.json           <- full state snapshot (optional)
 """
@@ -40,7 +39,6 @@ from typing import Any, Dict, List, Optional
 from core.models import (
     PodRecord,
     ProductRecord,
-    StacRecord,
     TimeseriesSnapshot,
     WorkflowRecord,
 )
@@ -107,7 +105,7 @@ class PersistenceManager:
         self._open_all()
 
     def _open_all(self) -> None:
-        names = ["workflows", "pods", "products", "stac", "timeseries"]
+        names = ["workflows", "pods", "products", "timeseries"]
         for name in names:
             path = self.raw_dir / f"{name}.ndjson"
             self._locks[name] = threading.Lock()
@@ -133,9 +131,6 @@ class PersistenceManager:
     def append_product(self, record: ProductRecord) -> None:
         self._append("products", record)
 
-    def append_stac(self, record: StacRecord) -> None:
-        self._append("stac", record)
-
     def append_timeseries(self, snapshot: TimeseriesSnapshot) -> None:
         self._append("timeseries", snapshot)
 
@@ -156,7 +151,6 @@ class PersistenceManager:
             workflows = ctx.snapshot_workflows()
             pods = ctx.snapshot_pods()
             products = ctx.snapshot_products()
-            stac_records = ctx.snapshot_stac()
             timeseries = ctx.snapshot_timeseries()
 
             data = {
@@ -166,7 +160,6 @@ class PersistenceManager:
                 "workflows": [dataclasses.asdict(w) for w in workflows],
                 "pods": [dataclasses.asdict(p) for p in pods],
                 "products": [dataclasses.asdict(p) for p in products],
-                "stac_records": [dataclasses.asdict(s) for s in stac_records],
                 "timeseries": [dataclasses.asdict(t) for t in timeseries],
             }
 

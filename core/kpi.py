@@ -19,7 +19,7 @@ import logging
 import math
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -180,7 +180,6 @@ class KPIEngine:
         run_finished_at: Optional[datetime] = None,
         dispatcher_template: str = "ingestion-dispatcher",
         omnipass_template: str = "ingestor-omnipass",
-        stac_ref_steps: Optional[List[str]] = None,
     ):
         # Compute derived fields in-place on copies so originals are not mutated
         self.workflows = [compute_workflow_derived(dict(w)) for w in workflows]
@@ -191,59 +190,6 @@ class KPIEngine:
         self.run_finished_at = run_finished_at or datetime.now(timezone.utc)
         self.dispatcher_template = dispatcher_template.lower()
         self.omnipass_template = omnipass_template.lower()
-        # Steps whose finish time marks "STAC has been posted" in the omnipass workflow.
-        # The exit-handler steps (message-passthrough, send-message-success) run AFTER
-        # STAC is published, so they must not be used as the reference.
-        self.stac_ref_steps: List[str] = stac_ref_steps or [
-            "post-results",
-            "stage-out",
-            "calrissian-argo-wf-runner",
-        ]
-        # Index: workflow_name → {step_name → latest pod_finished_at (datetime)}
-        self._pod_finish_index: Dict[str, Dict[str, datetime]] = self._build_pod_finish_index()
-
-    # ------------------------------------------------------------------
-    # Pod finish index
-    # ------------------------------------------------------------------
-
-    def _build_pod_finish_index(self) -> Dict[str, Dict[str, datetime]]:
-        """
-        Build workflow_name → {step_name → latest pod_finished_at} mapping.
-
-        Used by business_kpis() to resolve the correct stac_latency reference
-        point (last main-workflow step finish) without relying on
-        workflow_finished_at which, in pod-based mode, reflects exit-handler
-        pod times rather than the end of the CWL computation.
-        """
-        index: Dict[str, Dict[str, datetime]] = defaultdict(dict)
-        for pod in self.pods:
-            wf = pod.get("workflow_name")
-            step = pod.get("step_name")
-            finished_str = pod.get("pod_finished_at")
-            if not (wf and step and finished_str):
-                continue
-            finished = _parse_dt(finished_str)
-            if finished is None:
-                continue
-            existing = index[wf].get(step)
-            if existing is None or finished > existing:
-                index[wf][step] = finished
-        return dict(index)
-
-    def _stac_ref_time(self, product: dict) -> Optional[datetime]:
-        """
-        Return the best available finish time of the last STAC-posting step
-        for *product*.  Falls back to workflow_finished_at when no matching
-        pod is found.
-        """
-        wf_name = product.get("workflow_name")
-        wf_steps = self._pod_finish_index.get(wf_name or "") or {}
-        for step in self.stac_ref_steps:
-            t = wf_steps.get(step)
-            if t is not None:
-                return t
-        # Fallback: workflow_finished_at from the product record itself
-        return _parse_dt(product.get("workflow_finished_at"))
 
     # ------------------------------------------------------------------
     # Business KPIs
@@ -279,21 +225,6 @@ class KPIEngine:
             if p.get("end_to_end_sec") is not None
         ]
 
-        # stac_latency = stac_seen_at - last_main_step_finish_time.
-        # The omnipass exit-handler runs AFTER STAC is published (negative latency
-        # if we used workflow_finished_at).  Use the pod finish time of the last
-        # STAC-posting step (post-results / stage-out) as the reference instead.
-        stac_latency_values = []
-        for p in completed:
-            stac_seen = _parse_dt(p.get("stac_seen_at"))
-            if stac_seen is None:
-                continue
-            ref = self._stac_ref_time(p)
-            if ref is None:
-                continue
-            val = (stac_seen - ref).total_seconds()
-            stac_latency_values.append(val)
-
         return {
             "total_products_observed": total_observed,
             "total_products_completed": total_completed,
@@ -305,8 +236,6 @@ class KPIEngine:
             "e2e_p50": _percentile(e2e_values, 50),
             "e2e_p95": _percentile(e2e_values, 95),
             "e2e_p99": _percentile(e2e_values, 99),
-            "stac_latency_avg": _safe_mean(stac_latency_values),
-            "stac_latency_p95": _percentile(stac_latency_values, 95),
         }
 
     def _peak_rolling_throughput(self) -> Optional[float]:

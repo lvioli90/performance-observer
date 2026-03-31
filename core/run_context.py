@@ -26,7 +26,6 @@ from core.models import (
     PodRecord,
     ProductRecord,
     RunSummary,
-    StacRecord,
     TimeseriesSnapshot,
     WorkflowRecord,
 )
@@ -105,8 +104,6 @@ class RunContext:
         # Pod polling must be aggressive (≤15s) to catch succeeded pods before GC.
         self.poll_pod_sec: int = int(p.get("pod_status_sec", 15))
         self.poll_metrics_sec: int = int(p.get("pod_metrics_sec", 20))
-        self.poll_stac_sec: int = int(p.get("stac_sec", 30))
-        self.poll_artifact_sec: int = int(p.get("artifact_check_sec", 20))
         self.poll_timeseries_flush_sec: int = int(p.get("timeseries_flush_sec", 30))
 
         # --- Timing ---
@@ -139,21 +136,7 @@ class RunContext:
             "calrissian_tool_label_selector", ""
         )
 
-        # --- STAC config ---
-        s = cfg.get("stac", {})
-        self.stac_endpoint: str = s.get("endpoint", "")
-        self.stac_public_endpoint: str = s.get("public_endpoint", "")
-        # Token: config value takes precedence; fall back to STAC_TOKEN env var.
-        # Strip whitespace and any accidental "Bearer " prefix.
-        _raw_token = s.get("token") or os.environ.get("STAC_TOKEN", "")
-        _raw_token = (_raw_token or "").strip()
-        if _raw_token.lower().startswith("bearer "):
-            _raw_token = _raw_token[len("bearer "):].strip()
-        self.stac_token: str = _raw_token
-        self.stac_collection: str = s.get("collection_id", "")
-        self.stac_verify_tls: bool = bool(s.get("verify_tls", True))
-
-        # --- MinIO config (for kafka-message.json artifact reading) ---
+        # --- MinIO config ---
         m = cfg.get("minio", {})
         self.minio_endpoint: str = m.get("endpoint", "")
         self.minio_access_key: str = m.get("access_key", "")
@@ -186,12 +169,6 @@ class RunContext:
             "product_id_from_s3_key",
             r"(?P<product_id>[^/]+?)(?:\.zip|\.tar\.gz|\.tgz|\.nc|\.h5)?$",
         )
-        # STAC item ID derivation (fallback when artifact is not available)
-        self.corr_stac_id_template: str = c.get(
-            "stac_item_id_from_product_id", "{product_id}"
-        )
-        # Whether to read kafka-message.json artifacts from MinIO for STAC discovery
-        self.corr_use_artifact_stac: bool = bool(c.get("use_artifact_stac_discovery", True))
         # Time-window fallback
         self.corr_time_window_sec: int = int(c.get("time_window_fallback_sec", 60))
 
@@ -219,8 +196,6 @@ class RunContext:
         self.pods: Dict[str, PodRecord] = {}
         # product_id -> ProductRecord
         self.products: Dict[str, ProductRecord] = {}
-        # product_id -> StacRecord
-        self.stac_records: Dict[str, StacRecord] = {}
         # ordered list of TimeseriesSnapshot
         self.timeseries: List[TimeseriesSnapshot] = []
 
@@ -290,10 +265,6 @@ class RunContext:
             self.products[record.product_id] = record
             self._products_dirty.append(record.product_id)
 
-    def add_or_update_stac(self, record: StacRecord) -> None:
-        with self._lock:
-            self.stac_records[record.product_id] = record
-
     def append_timeseries(self, snapshot: TimeseriesSnapshot) -> None:
         with self._lock:
             self.timeseries.append(snapshot)
@@ -310,23 +281,9 @@ class RunContext:
         with self._lock:
             return list(self.products.values())
 
-    def snapshot_stac(self) -> List[StacRecord]:
-        with self._lock:
-            return list(self.stac_records.values())
-
     def snapshot_timeseries(self) -> List[TimeseriesSnapshot]:
         with self._lock:
             return list(self.timeseries)
-
-    # ------------------------------------------------------------------
-    # Correlation helpers (stateless, no lock needed)
-    # ------------------------------------------------------------------
-
-    def derive_stac_item_id(self, product_id: str) -> str:
-        """Derive the expected STAC item id from a product_id (fallback template)."""
-        if not self.corr_stac_id_template:
-            return product_id
-        return self.corr_stac_id_template.format(product_id=product_id)
 
     # ------------------------------------------------------------------
     # Lifecycle helpers

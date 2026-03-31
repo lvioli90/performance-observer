@@ -77,8 +77,6 @@ BIZ_METRICS: List[Tuple[str, str, bool]] = [
     ("e2e_avg",                  "E2E avg (s)",             True),
     ("e2e_p50",                  "E2E p50 (s)",             True),
     ("e2e_p95",                  "E2E p95 (s)",             True),
-    ("stac_latency_avg",         "STAC latency avg (s)",    True),
-    ("stac_latency_p95",         "STAC latency p95 (s)",    True),
     ("pipeline_gap_avg",         "Pipeline gap avg (s)",    True),
     ("pipeline_gap_p95",         "Pipeline gap p95 (s)",    True),
     ("gap_to_deletion_avg",      "Gap→deletion avg (s)",    True),

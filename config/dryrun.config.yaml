@@ -9,7 +9,7 @@
 #   2. (in another terminal) python scripts/drop_product.py \
 #        --config config/dryrun.config.yaml \
 #        --file /path/to/IMH01_0_ST__OPT8_....zip
-#   3. Wait for observer to print "STAC published" and stop automatically
+#   3. Wait for observer to print "All tracked products terminal" and stop automatically
 #   4. python scripts/compute_kpis.py --run-dir results/dryrun-001
 #   5. python scripts/plot_results.py  --run-dir results/dryrun-001
 # ============================================================
@@ -34,23 +34,12 @@ kubernetes:
   context: "uatmkpl"
 
 # --------------------------------------------------------
-# STAC catalog
-# --------------------------------------------------------
-stac:
-  endpoint: "http://stac-api.datalake.svc/api"
-  public_endpoint: "https://discover-uat.iride.earth"
-  token: ""          # set your Bearer token here for external access
-  collection_id: "PATHFINDER-1BST-OPT8"
-  verify_tls: true
-
-# --------------------------------------------------------
-# MinIO / S3
+# MinIO / S3 (drop-bucket watcher — records T0 in real-time)
 # --------------------------------------------------------
 minio:
   endpoint: "s3.iride.earth"
   access_key: "4JNpgMzz469ctmm2WMhy"
   secret_key: "psK7sSXRQyITnuzjo7TxtkSDih8ne3Mz5ChirWGu"
-  artifact_bucket: "datalake-uat-workflows"
   drop_bucket: "datalake-uat-drop-bucket"
   drop_prefix: ""
   drop_poll_sec: 10          # more aggressive for dry run
@@ -65,8 +54,6 @@ polling:
   workflow_status_sec: 10
   pod_status_sec: 10
   pod_metrics_sec: 10
-  stac_sec: 15               # poll STAC every 15s to catch publication quickly
-  artifact_check_sec: 10
   timeseries_flush_sec: 15
 
 # --------------------------------------------------------
@@ -77,7 +64,7 @@ polling:
 # --------------------------------------------------------
 timing:
   max_duration_sec: 1200    # 20 min — more than enough for 1 product
-  grace_period_sec: 180     # 3 min after time limit to catch late STAC updates
+  grace_period_sec: 180     # 3 min after time limit to catch late deletion completions
 
 # --------------------------------------------------------
 # Correlation
@@ -91,8 +78,6 @@ correlation:
   deletion_template: "pdgs-ingestion-delete"
   deletion_url_param: "url"
   product_id_from_s3_key: "(?P<product_id>[^/]+?)(?:\\.zip|\\.tar\\.gz|\\.tgz|\\.nc|\\.h5)?$"
-  stac_item_id_from_product_id: "{product_id}"
-  use_artifact_stac_discovery: true
   time_window_fallback_sec: 300  # 5 min — generous for slow Kafka/trigger latency
 
 # --------------------------------------------------------

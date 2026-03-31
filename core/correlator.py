@@ -101,22 +101,9 @@ class Correlator:
     # Main entry point
     # ------------------------------------------------------------------
 
-    def correlate_workflow(
-        self,
-        wf: WorkflowRecord,
-        minio_collector=None,
-    ) -> Optional[str]:
+    def correlate_workflow(self, wf: WorkflowRecord) -> Optional[str]:
         """
         Determine product_id for a workflow and upsert the ProductRecord.
-
-        Parameters
-        ----------
-        wf : WorkflowRecord
-        minio_collector : MinioArtifactCollector or None
-            If provided and this is a dispatcher workflow, resolve T0 from
-            ctx.drop_bucket_events (set by MinioDropWatcher) or fall back
-            to MinIO stat_object via minio_collector.
-
         Returns product_id if found, None otherwise.
         """
         wf_type = self._detect_workflow_type(wf)
@@ -147,11 +134,6 @@ class Correlator:
         wf.product_id = product_id
         self._upsert_product(product_id, wf, wf_type)
 
-        # Resolve true T0 from MinIO stat_object immediately after dispatcher correlation.
-        # T0 = LastModified of the object in the drop-bucket = most accurate ingest time.
-        if wf_type == _DISPATCHER and minio_collector is not None:
-            self._resolve_t0(product_id, wf, minio_collector)
-
         # When the omnipass brings a real product_id via its reference parameter,
         # a phantom dispatcher product may exist (created by Fallback 4 when the
         # drop-watcher was unavailable, and possibly already claimed by THIS omnipass
@@ -161,58 +143,6 @@ class Correlator:
             self._merge_phantom_dispatcher(product_id, omnipass_wf_name=wf.workflow_name)
 
         return product_id
-
-    def _resolve_t0(self, product_id: str, wf: WorkflowRecord, minio_collector) -> None:
-        """
-        Set ingest_reference_time (true T0) on the ProductRecord.
-
-        Priority:
-          1. ctx.drop_bucket_events[s3_key]  — set by MinioDropWatcher in real-time
-             (most accurate: records the exact moment the object appeared)
-          2. minio_collector.fetch_ingest_time()  — retroactive stat_object call
-             (accurate but requires a live MinIO connection at correlation time)
-          3. Falls back to dispatcher.created_at already set in _update_from_dispatcher
-        """
-        s3_key = wf.parameters.get(self.ctx.corr_dispatcher_s3_key_param, "")
-        if not s3_key:
-            return
-
-        # Priority 1: real-time observation from drop-bucket watcher
-        with self.ctx._lock:
-            t0 = self.ctx.drop_bucket_events.get(s3_key)
-
-        if t0 is not None:
-            source = "drop-watcher"
-        else:
-            # Priority 2: retroactive stat_object via MinioArtifactCollector
-            s3_bucket = wf.parameters.get(
-                self.ctx.corr_dispatcher_s3_bucket_param, "drop-bucket"
-            )
-            t0 = minio_collector.fetch_ingest_time(product_id, s3_key, s3_bucket)
-            source = "stat_object"
-
-        if t0 is None:
-            return   # falls back to dispatcher.created_at set in _update_from_dispatcher
-
-        with self.ctx._lock:
-            product = self.ctx.products.get(product_id)
-            if product is not None:
-                product.ingest_reference_time = t0
-                self.ctx._products_dirty.append(product_id)
-                dispatcher_created = product.dispatcher_created_at
-                delta = (
-                    (dispatcher_created - t0).total_seconds()
-                    if dispatcher_created else float("nan")
-                )
-                logger.info(
-                    "T0 set from %s: product_id=%s T0=%s "
-                    "(dispatcher.created_at=%s delta=%.1fs)",
-                    source,
-                    product_id,
-                    t0.isoformat(),
-                    dispatcher_created.isoformat() if dispatcher_created else "N/A",
-                    delta,
-                )
 
     def _merge_phantom_dispatcher(
         self, real_product_id: str, omnipass_wf_name: Optional[str] = None
@@ -739,76 +669,6 @@ class Correlator:
         # unless it is already marked succeeded by a previous signal (STAC / omnipass).
         if wf.phase == "Succeeded":
             record.final_status = "succeeded"
-
-    # ------------------------------------------------------------------
-    # STAC update from MinIO artifact
-    # ------------------------------------------------------------------
-
-    def update_stac_from_artifact(
-        self,
-        product_id: str,
-        stac_item_id: str,
-        collection_id: str,
-        stac_seen_at: datetime,
-        stac_url: Optional[str] = None,
-    ) -> None:
-        """
-        Register STAC coordinates (item_id, collection) discovered from the
-        omnipass kafka-message.json artifact.
-
-        Called by collectors/minio_artifact.py after reading the artifact.
-
-        IMPORTANT — re-ingestion semantics:
-        The artifact tells us *which* STAC item was written, but NOT when the
-        STAC catalog actually reflected the update.  For re-ingested products
-        the item already exists in the catalog, so finding it is not proof of
-        publication.  The authoritative signal is ``properties.updated`` from
-        the STAC API, which the StacCollector checks on every polling cycle.
-
-        Therefore this method only stores the STAC coordinates in a StacRecord
-        and does NOT set ``product.stac_seen_at``.  The StacCollector will set
-        ``stac_seen_at`` once it confirms that ``properties.updated`` is past
-        ``workflow_finished_at``.
-        """
-        from core.models import StacRecord
-
-        stac_record = StacRecord(
-            run_id=self.ctx.run_id,
-            product_id=product_id,
-            stac_item_id=stac_item_id,
-            collection_id=collection_id,
-            first_seen_at=None,        # set by StacCollector after verifying properties.updated
-            verification_status="pending_update_check",
-            discovery_method="artifact",
-            stac_url=stac_url,
-        )
-        self.ctx.add_or_update_stac(stac_record)
-        logger.debug(
-            "STAC coordinates registered from artifact: product_id=%s item_id=%s collection=%s"
-            " (stac_seen_at deferred to StacCollector)",
-            product_id, stac_item_id, collection_id,
-        )
-
-    # ------------------------------------------------------------------
-    # STAC update from polling
-    # ------------------------------------------------------------------
-
-    def update_stac_from_poll(
-        self, product_id: str, stac_seen_at: datetime
-    ) -> None:
-        """
-        Mark a product as seen in STAC from direct polling (fallback path).
-
-        STAC publication is the authoritative completion signal: once the STAC
-        API confirms the item is updated, the product is considered succeeded
-        regardless of whether the Argo workflow phase has been polled yet.
-        """
-        with self.ctx._lock:
-            product = self.ctx.products.get(product_id)
-            if product and product.stac_seen_at is None:
-                product.stac_seen_at = stac_seen_at
-                product.final_status = "succeeded"
-                self.ctx._products_dirty.append(product_id)
 
     # ------------------------------------------------------------------
     # Orphan drop registration

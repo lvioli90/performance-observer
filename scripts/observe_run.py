@@ -7,8 +7,7 @@ Main observer entry point.
 Starts watching an ALREADY-RUNNING ingestion test and collects:
   - Argo workflow states (polled every ``workflow_status_sec``)
   - Kubernetes pod states (polled every ``pod_status_sec``)
-  - Kubernetes pod metrics / CPU / memory (polled every ``pod_metrics_sec``)
-  - STAC item visibility (polled every ``stac_sec``)
+  - Kubernetes pod resource metrics (polled every ``pod_metrics_sec``)
 
 Writes all raw observations incrementally to NDJSON files.
 Saves checkpoints periodically to survive interruptions.
@@ -48,8 +47,6 @@ from core.models import TimeseriesSnapshot
 from core.persistence import PersistenceManager
 from collectors.argo import ArgoCollector
 from collectors.k8s import K8sCollector
-from collectors.stac import StacCollector
-from collectors.minio_artifact import MinioArtifactCollector
 from collectors.minio_drop_watcher import MinioDropWatcher
 
 # ---------------------------------------------------------------------------
@@ -90,7 +87,7 @@ def _compute_rolling_throughput(ctx: RunContext, window_sec: int = 300) -> Optio
     count = 0
     for p in ctx.snapshot_products():
         if p.final_status == "succeeded":
-            ts = p.workflow_finished_at or p.stac_seen_at
+            ts = p.deletion_finished_at or p.workflow_finished_at
             if ts and ts >= cutoff:
                 count += 1
     return (count / (window_sec / 60)) if window_sec > 0 else None
@@ -143,19 +140,14 @@ def _workflow_loop(
     argo: ArgoCollector,
     correlator: Correlator,
     pm: PersistenceManager,
-    minio_collector=None,
 ) -> None:
-    """
-    Polls Argo workflows, runs correlation, and resolves T0 from MinIO.
-    T0 = LastModified of the drop-bucket object (true ingest time).
-    Falls back to dispatcher.created_at when MinIO is unavailable.
-    """
+    """Polls Argo workflows and runs correlation."""
     logger = logging.getLogger("observer.workflow_loop")
     while not ctx.stop_event.is_set():
         try:
             records = argo.poll()
             for wf in records:
-                correlator.correlate_workflow(wf, minio_collector=minio_collector)
+                correlator.correlate_workflow(wf)
             pm.flush_dirty_workflows(ctx)
             pm.flush_dirty_products(ctx)
         except Exception as exc:
@@ -198,25 +190,6 @@ def _metrics_loop(
         ctx.stop_event.wait(timeout=ctx.poll_metrics_sec)
 
 
-def _stac_loop(
-    ctx: RunContext,
-    stac: StacCollector,
-    pm: PersistenceManager,
-) -> None:
-    """Polls STAC for item visibility on a fixed interval."""
-    logger = logging.getLogger("observer.stac_loop")
-    while not ctx.stop_event.is_set():
-        try:
-            new_items = stac.poll()
-            for item in new_items:
-                pm.append_stac(item)
-            pm.flush_dirty_products(ctx)
-        except Exception as exc:
-            logger.warning("STAC poll error (will retry): %s", exc)
-
-        ctx.stop_event.wait(timeout=ctx.poll_stac_sec)
-
-
 def _timeseries_loop(
     ctx: RunContext,
     argo: ArgoCollector,
@@ -233,27 +206,6 @@ def _timeseries_loop(
             logger.warning("Timeseries snapshot error: %s", exc)
 
         ctx.stop_event.wait(timeout=ctx.poll_timeseries_flush_sec)
-
-
-def _artifact_loop(
-    ctx: RunContext,
-    minio_collector,
-    correlator,
-    pm: PersistenceManager,
-) -> None:
-    """
-    Polls MinIO for kafka-message.json artifacts from completed omnipass workflows.
-    This is the primary STAC item discovery path (most reliable source).
-    """
-    logger = logging.getLogger("observer.artifact_loop")
-    while not ctx.stop_event.is_set():
-        try:
-            minio_collector.poll(correlator)
-            pm.flush_dirty_products(ctx)
-        except Exception as exc:
-            logger.warning("Artifact poll error (will retry): %s", exc)
-
-        ctx.stop_event.wait(timeout=ctx.poll_artifact_sec)
 
 
 def _drop_watcher_loop(
@@ -384,20 +336,12 @@ def main() -> None:
         ctx.minio_drop_lookback_sec,
         ctx.minio_drop_orphan_sec,
     )
-    logger.info("artifact_stac     = %s", ctx.corr_use_artifact_stac)
     logger.info("=" * 60)
-    if not ctx.minio_endpoint:
-        logger.warning(
-            "MinIO not configured — STAC discovery will use API polling fallback only. "
-            "Set minio.* in config for artifact-based (reliable) STAC item discovery."
-        )
 
     # Initialize components
     pm = PersistenceManager(ctx.output_dir)
     argo = ArgoCollector(ctx)
     k8s = K8sCollector(ctx)
-    stac_col = StacCollector(ctx)
-    minio_col = MinioArtifactCollector(ctx)
     drop_watcher = MinioDropWatcher(ctx)
     correlator = Correlator(ctx)
 
@@ -429,7 +373,7 @@ def main() -> None:
             # Also registers orphan drops as failed ProductRecords after orphan_sec.
         ),
         threading.Thread(
-            target=_workflow_loop, args=(ctx, argo, correlator, pm, minio_col),
+            target=_workflow_loop, args=(ctx, argo, correlator, pm),
             name="workflow-loop", daemon=True
         ),
         threading.Thread(
@@ -442,16 +386,6 @@ def main() -> None:
             target=_metrics_loop, args=(ctx, k8s, pm),
             name="metrics-loop", daemon=True
             # NOTE: poll_metrics_sec=20 for same reason — pods are deleted 30s after success.
-        ),
-        threading.Thread(
-            target=_stac_loop, args=(ctx, stac_col, pm),
-            name="stac-loop", daemon=True
-            # Fallback STAC polling for when MinIO artifact is unavailable.
-        ),
-        threading.Thread(
-            target=_artifact_loop, args=(ctx, minio_col, correlator, pm),
-            name="artifact-loop", daemon=True
-            # Primary STAC discovery: reads kafka-message.json from MinIO after omnipass completes.
         ),
         threading.Thread(
             target=_timeseries_loop, args=(ctx, argo, pm),
@@ -504,16 +438,19 @@ def main() -> None:
                 our_prods = prods
 
             def _terminal(p) -> bool:
-                return p.stac_seen_at is not None or p.final_status in ("failed", "timeout")
+                return (
+                    p.deletion_finished_at is not None
+                    or p.final_status in ("succeeded", "failed", "timeout")
+                )
 
             if our_prods and all(_terminal(p) for p in our_prods):
-                n_stac   = sum(1 for p in our_prods if p.stac_seen_at is not None)
+                n_done   = sum(1 for p in our_prods if p.deletion_finished_at is not None)
                 n_failed = sum(1 for p in our_prods if p.final_status in ("failed", "timeout"))
                 logger.info(
                     "All %d tracked product(s) terminal "
-                    "(%d STAC published, %d failed/timeout). "
+                    "(%d deletion complete, %d failed/timeout). "
                     "Entering grace period (%ds) then stopping...",
-                    len(our_prods), n_stac, n_failed,
+                    len(our_prods), n_done, n_failed,
                     ctx.grace_period_sec,
                 )
                 ctx.stop_event.wait(timeout=ctx.grace_period_sec)
@@ -526,19 +463,19 @@ def main() -> None:
                 wfs = ctx.snapshot_workflows()
                 pending = sum(1 for w in wfs if w.phase == "Pending")
                 running = sum(1 for w in wfs if w.phase == "Running")
-                completed = sum(1 for p in prods if p.final_status == "succeeded")
-                failed    = sum(1 for p in prods if p.final_status in ("failed", "timeout"))
-                stac_done = sum(1 for p in prods if p.stac_seen_at is not None)
+                completed  = sum(1 for p in prods if p.final_status == "succeeded")
+                failed     = sum(1 for p in prods if p.final_status in ("failed", "timeout"))
+                deletions  = sum(1 for p in prods if p.deletion_finished_at is not None)
                 logger.info(
                     "[+%dm] workflows: pending=%d running=%d | "
-                    "products: correlated=%d completed=%d failed=%d stac=%d",
+                    "products: correlated=%d completed=%d failed=%d deleted=%d",
                     int(elapsed / 60),
                     pending,
                     running,
                     len(prods),
                     completed,
                     failed,
-                    stac_done,
+                    deletions,
                 )
 
     except KeyboardInterrupt:

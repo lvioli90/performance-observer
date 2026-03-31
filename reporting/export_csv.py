@@ -47,9 +47,6 @@ PRODUCTS_COLUMNS = [
     # Pipeline gaps
     "pipeline_gap_sec",
     "gap_to_deletion_sec",
-    # STAC
-    "stac_seen_at",
-    "stac_publish_sec",
     # Deletion workflow
     "deletion_workflow_name",
     "deletion_created_at",
