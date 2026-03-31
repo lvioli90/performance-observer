@@ -396,36 +396,55 @@ class Correlator:
         url_param = self.ctx.corr_deletion_url_param
         url = wf.parameters.get(url_param, "")
 
-        if not url:
+        if url:
+            wf.object_key = url
+
+            # Strip the "s3://bucket/" prefix to get the relative key
+            s3_key = re.sub(r"^s3://[^/]+/", "", url)
+            product_id = self._extract_product_id_from_s3_key(s3_key)
+            if product_id:
+                logger.info(
+                    "Deletion correlated: wf=%s url=%s product_id=%s",
+                    wf.workflow_name, url, product_id,
+                )
+                return product_id
+
+            # Fallback A: match by object_key on existing products
+            with self.ctx._lock:
+                for prod in self.ctx.products.values():
+                    if prod.object_key and prod.object_key == url:
+                        logger.info(
+                            "Deletion %s: matched product_id=%s via object_key",
+                            wf.workflow_name, prod.product_id,
+                    )
+                    return prod.product_id
+
+        else:
             logger.debug(
-                "Deletion %s: no '%s' parameter — cannot correlate",
+                "Deletion %s: no '%s' parameter in pod annotations — "
+                "trying fallback matching",
                 wf.workflow_name, url_param,
             )
-            return None
 
-        wf.object_key = url
-
-        # Strip the "s3://bucket/" prefix to get the relative key
-        s3_key = re.sub(r"^s3://[^/]+/", "", url)
-
-        product_id = self._extract_product_id_from_s3_key(s3_key)
-
+        # Fallback B: time-window match against omnipass finished_at.
+        # The deletion workflow is triggered immediately after omnipass succeeds,
+        # so deletion.created_at ≈ omnipass.workflow_finished_at + gap_to_deletion.
+        product_id = self._product_id_from_omnipass_timing(wf)
         if product_id:
             logger.info(
-                "Deletion correlated: wf=%s url=%s product_id=%s",
-                wf.workflow_name, url, product_id,
+                "Deletion %s: matched product_id=%s via omnipass timing (no url param)",
+                wf.workflow_name, product_id,
             )
             return product_id
 
-        # Fallback: match by object_key on existing products
-        with self.ctx._lock:
-            for prod in self.ctx.products.values():
-                if prod.object_key and prod.object_key == url:
-                    logger.info(
-                        "Deletion %s: matched product_id=%s via object_key",
-                        wf.workflow_name, prod.product_id,
-                    )
-                    return prod.product_id
+        # Fallback C: sole unclaimed omnipass product (safe for single-product dryrun).
+        product_id = self._product_id_any_unclaimed_omnipass()
+        if product_id:
+            logger.info(
+                "Deletion %s: linked to sole unclaimed omnipass product_id=%s",
+                wf.workflow_name, product_id,
+            )
+            return product_id
 
         return None
 
@@ -526,6 +545,53 @@ class Correlator:
         with self.ctx._lock:
             products = list(self.ctx.products.values())
         unclaimed = [p for p in products if p.dispatcher_workflow_name and not p.workflow_name]
+        if len(unclaimed) == 1:
+            return unclaimed[0].product_id
+        return None
+
+    def _product_id_from_omnipass_timing(
+        self, wf: WorkflowRecord
+    ) -> Optional[str]:
+        """
+        Find the ProductRecord whose omnipass finished_at is closest to this
+        deletion workflow's created_at, within corr_time_window_sec.
+
+        Used when the deletion workflow pod annotations don't carry the 'url'
+        parameter (common in pod-based reconstruction mode where only step-level
+        inputs appear in the template annotation).
+        """
+        if wf.created_at is None:
+            return None
+        window = self.ctx.corr_time_window_sec
+        with self.ctx._lock:
+            products = list(self.ctx.products.values())
+        best_id: Optional[str] = None
+        best_delta: Optional[float] = None
+        for prod in products:
+            # Only match products with omnipass done but no deletion yet
+            if prod.deletion_workflow_name:
+                continue
+            anchor = prod.workflow_finished_at or prod.workflow_created_at
+            if not anchor:
+                continue
+            delta = abs((wf.created_at - anchor).total_seconds())
+            if delta <= window and (best_delta is None or delta < best_delta):
+                best_delta = delta
+                best_id = prod.product_id
+        return best_id
+
+    def _product_id_any_unclaimed_omnipass(self) -> Optional[str]:
+        """
+        Return the product_id of any omnipass-correlated ProductRecord that has
+        not yet been claimed by a deletion workflow.
+        Safe for dryrun (1 product) where timing may prevent the window match.
+        """
+        with self.ctx._lock:
+            products = list(self.ctx.products.values())
+        unclaimed = [
+            p for p in products
+            if p.workflow_name and not p.deletion_workflow_name
+        ]
         if len(unclaimed) == 1:
             return unclaimed[0].product_id
         return None
