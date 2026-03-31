@@ -438,10 +438,18 @@ def main() -> None:
                 our_prods = prods
 
             def _terminal(p) -> bool:
-                return (
-                    p.deletion_finished_at is not None
-                    or p.final_status in ("succeeded", "failed", "timeout")
-                )
+                if ctx.corr_deletion_template:
+                    # Deletion tracking enabled: the pipeline is only complete when
+                    # the deletion workflow finishes.  Do NOT treat "succeeded" alone
+                    # as terminal — in pod-based Argo reconstruction that status can
+                    # be set transiently when early omnipass steps finish before the
+                    # calrissian pod is created (between-step gap with no running pods).
+                    return (
+                        p.deletion_finished_at is not None
+                        or p.final_status in ("failed", "timeout")
+                    )
+                # No deletion tracking: omnipass succeeded = terminal.
+                return p.final_status in ("succeeded", "failed", "timeout")
 
             if our_prods and all(_terminal(p) for p in our_prods):
                 n_done   = sum(1 for p in our_prods if p.deletion_finished_at is not None)

@@ -719,14 +719,23 @@ class Correlator:
         record.workflow_name = wf.workflow_name
         record.workflow_created_at = wf.created_at
         record.workflow_started_at = wf.started_at
-        # Never clear a finish timestamp once observed: Argo can briefly oscillate
-        # between Succeeded and Running between steps, causing wf.finished_at to
-        # temporarily become None.
-        if wf.finished_at and record.workflow_finished_at is None:
-            record.workflow_finished_at = wf.finished_at
-        # Never downgrade from succeeded: STAC confirmation or a prior Succeeded
-        # phase must not be overwritten by a transient Running phase.
-        if record.final_status != "succeeded":
+
+        # Advance workflow_finished_at to the latest observed value.
+        # In pod-based Argo reconstruction, early step pods can finish (causing
+        # a transient "Succeeded" + finished_at) before the next step's pod is
+        # even created.  The true workflow finish is the LATEST finished_at seen.
+        if wf.finished_at:
+            if record.workflow_finished_at is None or wf.finished_at > record.workflow_finished_at:
+                record.workflow_finished_at = wf.finished_at
+
+        # Only lock final_status="succeeded" when wf.finished_at is also present.
+        # This prevents locking on a transient pod-based "Succeeded" that can appear
+        # between workflow steps (early step pods done, next step pod not yet created).
+        # Once locked, never downgrade — a later transient Running state should not
+        # overwrite a genuine completion that was accompanied by a finished timestamp.
+        if wf.phase == "Succeeded" and wf.finished_at:
+            record.final_status = "succeeded"
+        elif record.final_status != "succeeded":
             record.final_status = _phase_to_status(wf.phase)
 
         # If dispatcher didn't provide ingest_reference_time, fall back to
