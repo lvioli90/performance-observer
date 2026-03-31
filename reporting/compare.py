@@ -37,6 +37,11 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 STEP_METRICS: List[Tuple[str, str, bool]] = [
+    ("scheduling_avg",     "Scheduling avg (s)",   True),
+    ("init_duration_avg",  "Init avg (s)",         True),
+    ("init_duration_p50",  "Init p50 (s)",         True),
+    ("init_duration_p95",  "Init p95 (s)",         True),
+    ("volume_attach_p50",  "Vol attach p50 (s)",   True),
     ("pending_avg",        "Pending avg (s)",      True),
     ("duration_avg",       "Duration avg (s)",     True),
     ("duration_p50",       "Duration p50 (s)",     True),
@@ -383,29 +388,39 @@ def write_comparison_md(
             "------:|------:|------:|"
             "------:|------:|------:|",
         ]
+        lines += [
+            f"| Step "
+            f"| Init {label_a} | Init {label_b} | Δ Init "
+            f"| Dur {label_a} | Dur {label_b} | Δ Dur "
+            f"| Run {label_a} | Run {label_b} | Δ Run |",
+            "|------|"
+            "------:|------:|------:|"
+            "------:|------:|------:|"
+            "------:|------:|------:|",
+        ]
         for row in rows_wft:
             sn = row.get("step_name", "")
+
+            i_a     = _fmt(row.get(f"init_duration_avg_{label_a}"), "s")
+            i_b     = _fmt(row.get(f"init_duration_avg_{label_b}"), "s")
+            i_delta = _fmt(row.get("init_duration_avg_delta"), "s")
+            i_trend = row.get("init_duration_avg_trend", "≈")
 
             d_a     = _fmt(row.get(f"duration_avg_{label_a}"), "s")
             d_b     = _fmt(row.get(f"duration_avg_{label_b}"), "s")
             d_delta = _fmt(row.get("duration_avg_delta"), "s")
             d_trend = row.get("duration_avg_trend", "≈")
 
-            cpu_a     = _fmt(row.get(f"cpu_peak_avg_{label_a}"), "m")
-            cpu_b     = _fmt(row.get(f"cpu_peak_avg_{label_b}"), "m")
-            cpu_delta = _fmt(row.get("cpu_peak_avg_delta"), "m")
-            cpu_trend = row.get("cpu_peak_avg_trend", "≈")
-
-            mem_a     = _fmt(row.get(f"mem_peak_avg_{label_a}"), " MiB")
-            mem_b     = _fmt(row.get(f"mem_peak_avg_{label_b}"), " MiB")
-            mem_delta = _fmt(row.get("mem_peak_avg_delta"), " MiB")
-            mem_trend = row.get("mem_peak_avg_trend", "≈")
+            r_a     = _fmt(row.get(f"running_avg_{label_a}"), "s")
+            r_b     = _fmt(row.get(f"running_avg_{label_b}"), "s")
+            r_delta = _fmt(row.get("running_avg_delta"), "s")
+            r_trend = row.get("running_avg_trend", "≈")
 
             lines.append(
                 f"| {sn} "
+                f"| {i_a} | {i_b} | {i_delta} {i_trend} "
                 f"| {d_a} | {d_b} | {d_delta} {d_trend} "
-                f"| {cpu_a} | {cpu_b} | {cpu_delta} {cpu_trend} "
-                f"| {mem_a} | {mem_b} | {mem_delta} {mem_trend} |"
+                f"| {r_a} | {r_b} | {r_delta} {r_trend} |"
             )
         lines.append("")
 
@@ -495,6 +510,21 @@ def generate_comparison_plots(
     )
     if p:
         generated["step_duration"] = p
+
+    # 1b. Init overhead comparison (key metric for storage optimisations)
+    init_a = [r.get(f"init_duration_avg_{label_a}") for r in step_comp]
+    init_b = [r.get(f"init_duration_avg_{label_b}") for r in step_comp]
+    if any(v is not None for v in init_a + init_b):
+        p = _grouped_bar(
+            f"Init Overhead avg: {label_a} vs {label_b}",
+            steps,
+            init_a,
+            init_b,
+            "Init duration avg (s)",
+            "step_init_comparison.png",
+        )
+        if p:
+            generated["step_init"] = p
 
     # 2. CPU peak
     p = _grouped_bar(
