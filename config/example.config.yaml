@@ -2,9 +2,10 @@
 # Performance Observer Suite - Configuration
 # Target platform: IRIDE UAT ingestion pipeline
 # ============================================================
-# Two sequential workflows per product:
+# Three sequential workflows per product:
 #   1. ingestion-dispatcher  (params: s3-bucket, s3-key, partitionkey)
 #   2. ingestor-omnipass     (params: reference=s3://bucket/key, partitionkey)
+#   3. pdgs-ingestion-delete (params: url=s3://bucket/key, stac_url, partitionkey)
 #
 # Products land at the ROOT of datalake-uat-drop-bucket (no directory prefix):
 #   s3://datalake-uat-drop-bucket/IMH01_0_ST__OPT8_20251219T....zip
@@ -166,7 +167,10 @@ timing:
 #               └─► ingestor-omnipass  (param: reference = s3://drop-bucket/{s3-key})
 #                       │  on success → writes {workflow.uid}/kafka-message.json
 #                       │              containing stac_url, stac_item.id, stac_item.collection
-#                       └─► STAC catalog
+#                       ├─► STAC catalog
+#                       │
+#                       └─► pdgs-ingestion-delete  (param: url = s3://drop-bucket/{s3-key})
+#                               removes product from drop-bucket — T_final for E2E KPI
 #
 # SHARED IDENTIFIER: the s3 object key (= s3-key in dispatcher = path in reference in omnipass)
 #
@@ -189,6 +193,17 @@ correlation:
   omnipass_template: "ingestor-omnipass"
   # Parameter name in omnipass that holds the full S3 URL (s3://bucket/key).
   omnipass_reference_param: "reference"
+
+  # --- Deletion template ---
+  # Template name substring to identify deletion workflows.
+  # These run after omnipass completes and delete the product from the drop-bucket.
+  # Workflow names match pattern: {deletion_template}-{number}-{hash}
+  # (e.g. "pdgs-ingestion-delete-1234-abc123de")
+  # Set to "" to disable deletion workflow tracking.
+  deletion_template: "pdgs-ingestion-delete"
+  # Parameter name in deletion workflow that holds the full S3 URL of the product.
+  # Same format as omnipass reference: "s3://drop-bucket/path/to/product.zip"
+  deletion_url_param: "url"
 
   # --- Product ID extraction ---
   # Regex applied to the s3-key (or path extracted from reference) to get product_id.

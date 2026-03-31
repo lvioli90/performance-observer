@@ -74,7 +74,7 @@ def compute_product_derived(p: dict) -> dict:
     """
     Compute derived seconds fields for a product record dict (in-place).
 
-    Two-workflow pipeline:
+    Three-workflow pipeline:
       dispatcher_queue_sec  = dispatcher started_at - created_at
       dispatcher_run_sec    = dispatcher finished_at - started_at
       workflow_queue_sec    = omnipass started_at - created_at   (the meaningful queue)
@@ -82,7 +82,12 @@ def compute_product_derived(p: dict) -> dict:
       pipeline_gap_sec      = omnipass created_at - dispatcher finished_at
                               (Kafka trigger latency: time from dispatcher done to omnipass created)
       stac_publish_sec      = stac_seen_at - omnipass finished_at
-      end_to_end_sec        = stac_seen_at - ingest_reference_time (= dispatcher created_at)
+      gap_to_deletion_sec   = deletion created_at - omnipass finished_at
+                              (time from omnipass done to deletion triggered)
+      deletion_queue_sec    = deletion started_at - created_at
+      deletion_run_sec      = deletion finished_at - started_at
+      end_to_end_sec        = deletion_finished_at - ingest_reference_time
+                              (falls back to stac_seen_at when deletion not observed)
     """
     # Dispatcher timing
     p["dispatcher_queue_sec"] = _delta_sec(
@@ -106,10 +111,19 @@ def compute_product_derived(p: dict) -> dict:
     p["stac_publish_sec"] = _delta_sec(
         p.get("workflow_finished_at"), p.get("stac_seen_at")
     )
-    # Full end-to-end from earliest observable event
-    p["end_to_end_sec"] = _delta_sec(
-        p.get("ingest_reference_time"), p.get("stac_seen_at")
+    # Deletion workflow timing
+    p["gap_to_deletion_sec"] = _delta_sec(
+        p.get("workflow_finished_at"), p.get("deletion_created_at")
     )
+    p["deletion_queue_sec"] = _delta_sec(
+        p.get("deletion_created_at"), p.get("deletion_started_at")
+    )
+    p["deletion_run_sec"] = _delta_sec(
+        p.get("deletion_started_at"), p.get("deletion_finished_at")
+    )
+    # Full end-to-end: T0 → deletion_finished_at (falls back to stac_seen_at)
+    t_final = p.get("deletion_finished_at") or p.get("stac_seen_at")
+    p["end_to_end_sec"] = _delta_sec(p.get("ingest_reference_time"), t_final)
     return p
 
 
@@ -329,6 +343,12 @@ class KPIEngine:
             w for w in finished_wf
             if "omnipass" in (w.get("template_name") or w.get("workflow_name", "")).lower()
         ]
+        deletion_kw = self.omnipass_template  # resolved later via ctx; use product-level
+        deletion_wf = [
+            w for w in finished_wf
+            if w.get("workflow_type") == "deletion"
+            or "delete" in (w.get("template_name") or w.get("workflow_name", "")).lower()
+        ]
 
         def _queue(wfs): return [w["queue_sec"] for w in wfs if w.get("queue_sec") is not None]
         def _run(wfs):   return [w["run_sec"] for w in wfs if w.get("run_sec") is not None]
@@ -338,6 +358,23 @@ class KPIEngine:
             p.get("pipeline_gap_sec")
             for p in self.products
             if p.get("pipeline_gap_sec") is not None
+        ]
+        # Gap from omnipass finish to deletion triggered
+        gap_to_del_values = [
+            p.get("gap_to_deletion_sec")
+            for p in self.products
+            if p.get("gap_to_deletion_sec") is not None
+        ]
+        # Deletion timing from ProductRecord derived fields
+        del_queue_values = [
+            p.get("deletion_queue_sec")
+            for p in self.products
+            if p.get("deletion_queue_sec") is not None
+        ]
+        del_run_values = [
+            p.get("deletion_run_sec")
+            for p in self.products
+            if p.get("deletion_run_sec") is not None
         ]
 
         # Max pending / running from timeseries
@@ -377,6 +414,14 @@ class KPIEngine:
             # Kafka trigger latency (dispatcher_finished → omnipass_created)
             "pipeline_gap_avg": _safe_mean(gap_values),
             "pipeline_gap_p95": _percentile(gap_values, 95),
+            # Deletion-specific (cleanup step after omnipass)
+            "deletion_queue_avg": _safe_mean(del_queue_values),
+            "deletion_queue_p95": _percentile(del_queue_values, 95),
+            "deletion_duration_avg": _safe_mean(_run(deletion_wf)),
+            "deletion_duration_p95": _percentile(_run(deletion_wf), 95),
+            # Gap from omnipass finish to deletion triggered
+            "gap_to_deletion_avg": _safe_mean(gap_to_del_values),
+            "gap_to_deletion_p95": _percentile(gap_to_del_values, 95),
             # Concurrency
             "max_pending_workflows": max_pending,
             "max_running_workflows": max_running,

@@ -29,15 +29,37 @@ PRODUCTS_COLUMNS = [
     "run_id",
     "product_id",
     "object_key",
+    # Dispatcher workflow
+    "dispatcher_workflow_name",
+    "dispatcher_created_at",
+    "dispatcher_started_at",
+    "dispatcher_finished_at",
+    "dispatcher_status",
+    "dispatcher_queue_sec",
+    "dispatcher_run_sec",
+    # Omnipass workflow
     "workflow_name",
     "workflow_created_at",
     "workflow_started_at",
     "workflow_finished_at",
-    "stac_seen_at",
-    "ingest_reference_time",
     "workflow_queue_sec",
     "workflow_run_sec",
+    # Pipeline gaps
+    "pipeline_gap_sec",
+    "gap_to_deletion_sec",
+    # STAC
+    "stac_seen_at",
     "stac_publish_sec",
+    # Deletion workflow
+    "deletion_workflow_name",
+    "deletion_created_at",
+    "deletion_started_at",
+    "deletion_finished_at",
+    "deletion_status",
+    "deletion_queue_sec",
+    "deletion_run_sec",
+    # End-to-end
+    "ingest_reference_time",
     "end_to_end_sec",
     "final_status",
 ]

@@ -234,18 +234,25 @@ class K8sCollector:
                         ):
                             self._enrich_pod_events(record, ns)
                             self._events_fetched.add(record.pod_name)
-                        # Apply workflow type filter: keep only dispatcher and omnipass pods.
-                        # Also classify workflow_type here so it is written to NDJSON.
+                        # Filter to tracked workflow types and classify.
                         if record.workflow_name:
-                            wn = record.workflow_name.lower()
+                            wn            = record.workflow_name.lower()
                             dispatcher_kw = self.ctx.corr_dispatcher_template.lower()
-                            omnipass_kw = self.ctx.corr_omnipass_template.lower()
-                            if dispatcher_kw not in wn and omnipass_kw not in wn:
+                            omnipass_kw   = self.ctx.corr_omnipass_template.lower()
+                            deletion_kw   = self.ctx.corr_deletion_template.lower()
+                            matches = (
+                                (dispatcher_kw and dispatcher_kw in wn)
+                                or (omnipass_kw and omnipass_kw in wn)
+                                or (deletion_kw and deletion_kw in wn)
+                            )
+                            if not matches:
                                 continue
                             if dispatcher_kw and dispatcher_kw in wn:
                                 record.workflow_type = "dispatcher"
                             elif omnipass_kw and omnipass_kw in wn:
                                 record.workflow_type = "omnipass"
+                            elif deletion_kw and deletion_kw in wn:
+                                record.workflow_type = "deletion"
                         # Apply tracked_steps filter
                         if self.ctx.tracked_steps and record.step_name:
                             if not any(
@@ -286,13 +293,16 @@ class K8sCollector:
                             continue
                         # Classify workflow_type from the correlated workflow_name
                         # (same logic as the Argo-pod loop above).
-                        wn = record.workflow_name.lower()
+                        wn            = record.workflow_name.lower()
                         dispatcher_kw = self.ctx.corr_dispatcher_template.lower()
                         omnipass_kw   = self.ctx.corr_omnipass_template.lower()
+                        deletion_kw   = self.ctx.corr_deletion_template.lower()
                         if dispatcher_kw and dispatcher_kw in wn:
                             record.workflow_type = "dispatcher"
                         elif omnipass_kw and omnipass_kw in wn:
                             record.workflow_type = "omnipass"
+                        elif deletion_kw and deletion_kw in wn:
+                            record.workflow_type = "deletion"
                         # Calrissian tool pods bypass the tracked_steps filter:
                         # they are tracked unconditionally.
                         self.ctx.add_or_update_pod(record)

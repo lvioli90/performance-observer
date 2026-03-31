@@ -22,13 +22,22 @@ Pipeline architecture
                       │  on exit → writes {workflow.uid}/kafka-message.json to MinIO
                       │            contains: stac_url, stac_item.id, stac_item.collection
                       │
-                      └─► STAC catalog
+                      ├─► STAC catalog
+                      │
+                      └─► deletion workflow
+                              param: url = "s3://drop-bucket/path/to/product.zip"
+                              │
+                              │  deletes product from drop-bucket after successful ingestion
+                              │  completion marks true T_final for end-to-end KPI
+                              │
+                              └─► (product removed from drop-bucket)
 
 Shared identifier
 -----------------
-The s3 object key is the only identifier shared by both workflows:
+The s3 object key is the only identifier shared by all three workflows:
   dispatcher:  s3-key parameter          (relative: "path/to/product.zip")
   omnipass:    reference parameter        (absolute: "s3://drop-bucket/path/to/product.zip")
+  deletion:    url parameter              (absolute: "s3://drop-bucket/path/to/product.zip")
   product_id:  filename without extension ("product")
 
 Correlation priority
@@ -69,7 +78,8 @@ logger = logging.getLogger(__name__)
 
 # Workflow type identifiers (matched against template_name or workflow_name)
 _DISPATCHER = "dispatcher"
-_OMNIPASS = "omnipass"
+_OMNIPASS   = "omnipass"
+_DELETION   = "deletion"
 
 
 class Correlator:
@@ -122,6 +132,8 @@ class Correlator:
             product_id = self._correlate_dispatcher(wf)
         elif wf_type == _OMNIPASS:
             product_id = self._correlate_omnipass(wf)
+        elif wf_type == _DELETION:
+            product_id = self._correlate_deletion(wf)
 
         if product_id is None:
             logger.warning(
@@ -266,7 +278,7 @@ class Correlator:
 
     def _detect_workflow_type(self, wf: WorkflowRecord) -> Optional[str]:
         """
-        Identify whether a workflow is a dispatcher or omnipass ingestor.
+        Identify whether a workflow is a dispatcher, omnipass ingestor, or deletion.
         Checks template_name first, then workflow_name as fallback.
         """
         search_in = [
@@ -274,13 +286,16 @@ class Correlator:
             wf.workflow_name.lower(),
         ]
         dispatcher_kw = self.ctx.corr_dispatcher_template.lower()
-        omnipass_kw = self.ctx.corr_omnipass_template.lower()
+        omnipass_kw   = self.ctx.corr_omnipass_template.lower()
+        deletion_kw   = self.ctx.corr_deletion_template.lower()
 
         for text in search_in:
             if dispatcher_kw and dispatcher_kw in text:
                 return _DISPATCHER
             if omnipass_kw and omnipass_kw in text:
                 return _OMNIPASS
+            if deletion_kw and deletion_kw in text:
+                return _DELETION
         return None
 
     # ------------------------------------------------------------------
@@ -421,6 +436,68 @@ class Correlator:
                 wf.workflow_name, reference, product_id,
             )
         return product_id
+
+    # ------------------------------------------------------------------
+    # Deletion workflow correlation
+    # ------------------------------------------------------------------
+
+    def _correlate_deletion(self, wf: WorkflowRecord) -> Optional[str]:
+        """
+        Extract product_id from the deletion workflow 'url' parameter.
+
+          url = "s3://drop-bucket/path/to/S2A_MSIL2A_20230101.zip"
+          object_key = url (stored as-is)
+          s3_key extracted = "path/to/S2A_MSIL2A_20230101.zip"
+          product_id = "S2A_MSIL2A_20230101"
+
+        The deletion workflow runs after omnipass completes successfully and
+        removes the product from the drop-bucket.  Its url parameter has the
+        same format as the omnipass reference parameter.
+
+        Fallback: match against an existing product whose object_key equals
+        the url (already correlated by dispatcher/omnipass).
+        """
+        # Already correlated on a previous poll — just update timing.
+        with self.ctx._lock:
+            for prod in self.ctx.products.values():
+                if prod.deletion_workflow_name == wf.workflow_name:
+                    return prod.product_id
+
+        url_param = self.ctx.corr_deletion_url_param
+        url = wf.parameters.get(url_param, "")
+
+        if not url:
+            logger.debug(
+                "Deletion %s: no '%s' parameter — cannot correlate",
+                wf.workflow_name, url_param,
+            )
+            return None
+
+        wf.object_key = url
+
+        # Strip the "s3://bucket/" prefix to get the relative key
+        s3_key = re.sub(r"^s3://[^/]+/", "", url)
+
+        product_id = self._extract_product_id_from_s3_key(s3_key)
+
+        if product_id:
+            logger.info(
+                "Deletion correlated: wf=%s url=%s product_id=%s",
+                wf.workflow_name, url, product_id,
+            )
+            return product_id
+
+        # Fallback: match by object_key on existing products
+        with self.ctx._lock:
+            for prod in self.ctx.products.values():
+                if prod.object_key and prod.object_key == url:
+                    logger.info(
+                        "Deletion %s: matched product_id=%s via object_key",
+                        wf.workflow_name, prod.product_id,
+                    )
+                    return prod.product_id
+
+        return None
 
     # ------------------------------------------------------------------
     # Parameter fallback helpers
@@ -582,6 +659,8 @@ class Correlator:
                 self._update_from_dispatcher(record, wf)
             elif wf_type == _OMNIPASS:
                 self._update_from_omnipass(record, wf)
+            elif wf_type == _DELETION:
+                self._update_from_deletion(record, wf)
 
             self.ctx._products_dirty.append(product_id)
             return record
@@ -635,6 +714,31 @@ class Correlator:
         # omnipass created_at (slightly less accurate but still useful).
         if record.ingest_reference_time is None and wf.created_at:
             record.ingest_reference_time = wf.created_at
+
+    def _update_from_deletion(
+        self, record: ProductRecord, wf: WorkflowRecord
+    ) -> None:
+        """
+        Populate ProductRecord fields from the deletion workflow.
+
+        The deletion workflow runs after omnipass succeeds and removes the
+        product from the drop-bucket.  Its completion is the definitive
+        T_final for the end-to-end KPI.
+        """
+        record.deletion_workflow_name = wf.workflow_name
+
+        if record.deletion_created_at is None:
+            record.deletion_created_at = wf.created_at
+        record.deletion_started_at = wf.started_at
+        # Never clear a finish timestamp once observed.
+        if wf.finished_at and record.deletion_finished_at is None:
+            record.deletion_finished_at = wf.finished_at
+        record.deletion_status = wf.phase
+
+        # Promote final_status to succeeded once deletion completes successfully,
+        # unless it is already marked succeeded by a previous signal (STAC / omnipass).
+        if wf.phase == "Succeeded":
+            record.final_status = "succeeded"
 
     # ------------------------------------------------------------------
     # STAC update from MinIO artifact

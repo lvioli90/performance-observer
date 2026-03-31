@@ -134,21 +134,31 @@ class ProductRecord:
     """
     Correlated end-to-end view for a single ingested product.
 
-    Two-workflow pipeline
-    ---------------------
-    Each product goes through two sequential Argo workflows:
-      1. ingestion-dispatcher  (fast: dispatches the job, seconds)
+    Three-workflow pipeline
+    -----------------------
+    Each product goes through three sequential Argo workflows:
+      1. ingestion-dispatcher  (fast: dispatches the job, ~20s)
       2. ingestor-omnipass     (heavy: runs calrissian CWL, minutes)
+      3. deletion              (cleanup: removes product from drop bucket, triggered
+                                after omnipass succeeds)
 
-    Both workflows carry the same S3 object key:
+    All three workflows carry the same S3 object key:
       dispatcher:  s3-key parameter = "path/to/product.zip"
       omnipass:    reference parameter = "s3://drop-bucket/path/to/product.zip"
+      deletion:    url parameter      = "s3://drop-bucket/path/to/product.zip"
 
     ingest_reference_time
     ---------------------
     Set to dispatcher_created_at (earliest observable event, closest to the
     actual MinIO drop). Falls back to omnipass created_at if dispatcher is
     not observed.
+
+    end_to_end_sec
+    --------------
+    T0 = ingest_reference_time (dispatcher_created_at or drop-bucket event)
+    T_final = deletion_finished_at when deletion is observed, else stac_seen_at.
+    The deletion workflow completion is the definitive end of the ingestion cycle
+    because it confirms the drop-bucket cleanup is done.
     """
 
     run_id: str
@@ -173,6 +183,13 @@ class ProductRecord:
     # --- STAC visibility ---
     stac_seen_at: Optional[datetime] = None
 
+    # --- Deletion workflow fields ---
+    deletion_workflow_name: Optional[str] = None
+    deletion_created_at: Optional[datetime] = None
+    deletion_started_at: Optional[datetime] = None
+    deletion_finished_at: Optional[datetime] = None
+    deletion_status: Optional[str] = None   # Succeeded | Failed | Running | ...
+
     # ingest_reference_time: dispatcher_created_at when available, else omnipass created_at.
     ingest_reference_time: Optional[datetime] = None
 
@@ -183,13 +200,19 @@ class ProductRecord:
     # Dispatcher-level (should be fast; high value = orchestration lag):
     dispatcher_queue_sec: Optional[float] = None
     dispatcher_run_sec: Optional[float] = None
-    # Pipeline gap (time between dispatcher finish and omnipass start):
-    pipeline_gap_sec: Optional[float] = None     # omnipass created_at - dispatcher finished_at
-    # End-to-end:
+    # Pipeline gap (Kafka trigger latency: dispatcher finish → omnipass created):
+    pipeline_gap_sec: Optional[float] = None
+    # Gap between omnipass finish and deletion triggered:
+    gap_to_deletion_sec: Optional[float] = None  # deletion_created_at - omnipass finished_at
+    # Deletion workflow timing:
+    deletion_queue_sec: Optional[float] = None   # deletion started_at - created_at
+    deletion_run_sec: Optional[float] = None     # deletion finished_at - started_at
+    # STAC publication latency (after omnipass finishes, before deletion):
     stac_publish_sec: Optional[float] = None     # stac_seen_at - omnipass finished_at
-    end_to_end_sec: Optional[float] = None       # stac_seen_at - ingest_reference_time
+    # Full end-to-end: T0 → deletion_finished_at (falls back to stac_seen_at):
+    end_to_end_sec: Optional[float] = None
 
-    # Final disposition (reflects omnipass phase)
+    # Final disposition (reflects the last completed workflow phase)
     final_status: str = "in_progress"  # succeeded | failed | timeout | in_progress
 
 

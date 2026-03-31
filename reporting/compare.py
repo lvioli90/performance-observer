@@ -58,21 +58,33 @@ STEP_METRICS: List[Tuple[str, str, bool]] = [
 
 # Pipeline-phase columns from products.csv
 PIPELINE_METRICS: List[Tuple[str, str, bool]] = [
-    ("workflow_queue_sec", "Workflow queue (s)", True),
-    ("workflow_run_sec",   "Workflow run (s)",   True),
-    ("stac_publish_sec",   "STAC publish (s)",   True),
-    ("end_to_end_sec",     "End-to-end (s)",     True),
+    ("dispatcher_queue_sec",   "Dispatcher queue (s)",     True),
+    ("dispatcher_run_sec",     "Dispatcher run (s)",       True),
+    ("pipeline_gap_sec",       "Pipeline gap (s)",         True),
+    ("workflow_queue_sec",     "Omnipass queue (s)",       True),
+    ("workflow_run_sec",       "Omnipass run (s)",         True),
+    ("stac_publish_sec",       "STAC publish (s)",         True),
+    ("gap_to_deletion_sec",    "Gap→deletion (s)",         True),
+    ("deletion_queue_sec",     "Deletion queue (s)",       True),
+    ("deletion_run_sec",       "Deletion run (s)",         True),
+    ("end_to_end_sec",         "End-to-end (s)",           True),
 ]
 
 # Keys from run_summary.json -> business section
 BIZ_METRICS: List[Tuple[str, str, bool]] = [
-    ("total_products_completed", "Products completed",   False),
-    ("success_rate",             "Success rate",         False),
-    ("e2e_avg",                  "E2E avg (s)",          True),
-    ("e2e_p50",                  "E2E p50 (s)",          True),
-    ("e2e_p95",                  "E2E p95 (s)",          True),
-    ("stac_latency_avg",         "STAC latency avg (s)", True),
-    ("stac_latency_p95",         "STAC latency p95 (s)", True),
+    ("total_products_completed", "Products completed",      False),
+    ("success_rate",             "Success rate",            False),
+    ("e2e_avg",                  "E2E avg (s)",             True),
+    ("e2e_p50",                  "E2E p50 (s)",             True),
+    ("e2e_p95",                  "E2E p95 (s)",             True),
+    ("stac_latency_avg",         "STAC latency avg (s)",    True),
+    ("stac_latency_p95",         "STAC latency p95 (s)",    True),
+    ("pipeline_gap_avg",         "Pipeline gap avg (s)",    True),
+    ("pipeline_gap_p95",         "Pipeline gap p95 (s)",    True),
+    ("gap_to_deletion_avg",      "Gap→deletion avg (s)",    True),
+    ("deletion_queue_avg",       "Deletion queue avg (s)",  True),
+    ("deletion_duration_avg",    "Deletion duration avg (s)", True),
+    ("deletion_duration_p95",    "Deletion duration p95 (s)", True),
 ]
 
 

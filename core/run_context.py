@@ -176,6 +176,11 @@ class RunContext:
         # Omnipass workflow identification
         self.corr_omnipass_template: str = c.get("omnipass_template", "ingestor-omnipass")
         self.corr_omnipass_reference_param: str = c.get("omnipass_reference_param", "reference")
+        # Deletion workflow identification (runs after omnipass, deletes from drop bucket)
+        # Workflow names match pattern: {deletion_template}-{number}-{hash}
+        self.corr_deletion_template: str = c.get("deletion_template", "")
+        # Parameter that carries the s3:// URL of the product (same format as omnipass reference)
+        self.corr_deletion_url_param: str = c.get("deletion_url_param", "url")
         # Product ID extraction from s3 key
         self.corr_product_id_s3_key_regex: str = c.get(
             "product_id_from_s3_key",

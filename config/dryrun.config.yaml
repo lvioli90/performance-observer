@@ -88,6 +88,8 @@ correlation:
   dispatcher_s3_bucket_param: "s3-bucket"
   omnipass_template: "pdgs-omnipass-ingestion"
   omnipass_reference_param: "reference"
+  deletion_template: "pdgs-ingestion-delete"
+  deletion_url_param: "url"
   product_id_from_s3_key: "(?P<product_id>[^/]+?)(?:\\.zip|\\.tar\\.gz|\\.tgz|\\.nc|\\.h5)?$"
   stac_item_id_from_product_id: "{product_id}"
   use_artifact_stac_discovery: true
