@@ -373,19 +373,22 @@ class Correlator:
 
     def _correlate_deletion(self, wf: WorkflowRecord) -> Optional[str]:
         """
-        Extract product_id from the deletion workflow 'url' parameter.
+        Extract product_id from the deletion workflow parameters.
 
+        Primary (url param available in pod annotations):
           url = "s3://drop-bucket/path/to/S2A_MSIL2A_20230101.zip"
-          object_key = url (stored as-is)
-          s3_key extracted = "path/to/S2A_MSIL2A_20230101.zip"
-          product_id = "S2A_MSIL2A_20230101"
+          → product_id = "S2A_MSIL2A_20230101"
 
-        The deletion workflow runs after omnipass completes successfully and
-        removes the product from the drop-bucket.  Its url parameter has the
-        same format as the omnipass reference parameter.
+        In pod-based Argo reconstruction mode the 'url' workflow argument is
+        NOT written to pod annotations (only step-level inputs appear there).
+        Fallback chain handles this common case:
 
-        Fallback: match against an existing product whose object_key equals
-        the url (already correlated by dispatcher/omnipass).
+          A. url param present → regex extraction from s3 key
+          A2. url param present → match existing product by object_key
+          B. stac_url param → extract item_id from last URL path segment
+             stac_url = .../collections/{coll}/items/{item_id}
+          C. Time-window match: deletion.created_at ≈ omnipass.finished_at
+          D. Sole unclaimed omnipass product (safe for single-product dryrun)
         """
         # Already correlated on a previous poll — just update timing.
         with self.ctx._lock:
@@ -398,46 +401,66 @@ class Correlator:
 
         if url:
             wf.object_key = url
-
-            # Strip the "s3://bucket/" prefix to get the relative key
             s3_key = re.sub(r"^s3://[^/]+/", "", url)
             product_id = self._extract_product_id_from_s3_key(s3_key)
             if product_id:
                 logger.info(
-                    "Deletion correlated: wf=%s url=%s product_id=%s",
-                    wf.workflow_name, url, product_id,
+                    "Deletion correlated via url: wf=%s product_id=%s",
+                    wf.workflow_name, product_id,
                 )
                 return product_id
 
-            # Fallback A: match by object_key on existing products
+            # Fallback A2: match existing product by object_key equality
             with self.ctx._lock:
                 for prod in self.ctx.products.values():
                     if prod.object_key and prod.object_key == url:
                         logger.info(
                             "Deletion %s: matched product_id=%s via object_key",
                             wf.workflow_name, prod.product_id,
-                    )
-                    return prod.product_id
-
+                        )
+                        return prod.product_id
         else:
             logger.debug(
-                "Deletion %s: no '%s' parameter in pod annotations — "
-                "trying fallback matching",
+                "Deletion %s: '%s' not in pod annotations — trying fallbacks",
                 wf.workflow_name, url_param,
             )
 
-        # Fallback B: time-window match against omnipass finished_at.
-        # The deletion workflow is triggered immediately after omnipass succeeds,
-        # so deletion.created_at ≈ omnipass.workflow_finished_at + gap_to_deletion.
+        # Fallback B: stac_url parameter → item_id = last path segment.
+        # stac_url = ".../collections/{coll}/items/{item_id}"
+        # item_id typically equals the product_id (filename without extension).
+        stac_url = wf.parameters.get("stac_url", "")
+        if stac_url:
+            item_id = stac_url.rstrip("/").rsplit("/", 1)[-1]
+            if item_id:
+                # item_id IS the product_id: try direct lookup first
+                with self.ctx._lock:
+                    if item_id in self.ctx.products:
+                        logger.info(
+                            "Deletion %s: matched product_id=%s via stac_url item_id",
+                            wf.workflow_name, item_id,
+                        )
+                        return item_id
+                # Then try regex extraction in case item_id has a suffix
+                product_id = self._extract_product_id_from_s3_key(item_id)
+                if product_id:
+                    with self.ctx._lock:
+                        if product_id in self.ctx.products:
+                            logger.info(
+                                "Deletion %s: matched product_id=%s via stac_url regex",
+                                wf.workflow_name, product_id,
+                            )
+                            return product_id
+
+        # Fallback C: time-window match against omnipass finished_at.
         product_id = self._product_id_from_omnipass_timing(wf)
         if product_id:
             logger.info(
-                "Deletion %s: matched product_id=%s via omnipass timing (no url param)",
+                "Deletion %s: matched product_id=%s via omnipass timing",
                 wf.workflow_name, product_id,
             )
             return product_id
 
-        # Fallback C: sole unclaimed omnipass product (safe for single-product dryrun).
+        # Fallback D: sole unclaimed omnipass product (safe for single-product dryrun).
         product_id = self._product_id_any_unclaimed_omnipass()
         if product_id:
             logger.info(
